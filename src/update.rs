@@ -30,6 +30,7 @@ struct File {
 }
 
 /// A newer version, downloaded and checked, ready to be opened.
+#[derive(Debug)]
 pub struct Update {
     pub version: String,
     pub installer: PathBuf,
@@ -65,7 +66,22 @@ fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// The key updates are signed with; None in a build made without one.
+fn public_key() -> Option<Vec<u8>> {
+    option_env!("BKN_UPDATE_KEY").and_then(|key| STANDARD.decode(key).ok())
+}
+
+/// One check at a time: the timer and the button in Settings would otherwise
+/// write the same installer file at once.
+static CHECKING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// One check, now: for the button in Settings.
+pub async fn check_now() -> Result<Option<Update>> {
+    check(&public_key().context("this build has no update key")?).await
+}
+
 async fn check(public_key: &[u8]) -> Result<Option<Update>> {
+    let _one_at_a_time = CHECKING.lock().await;
     let manifest = crate::api::download("latest.json").await?;
     let signature = crate::api::download("latest.json.sig").await?;
     let manifest = verified(&manifest, &signature, public_key)?;
@@ -88,9 +104,7 @@ async fn check(public_key: &[u8]) -> Result<Option<Update>> {
 
 /// Looks for an update now and every six hours until one is ready.
 pub async fn watch(found: UnboundedSender<Update>) {
-    let Some(public_key) = option_env!("BKN_UPDATE_KEY").and_then(|key| STANDARD.decode(key).ok()) else {
-        return;
-    };
+    let Some(public_key) = public_key() else { return };
     loop {
         match check(&public_key).await {
             Ok(Some(update)) => {

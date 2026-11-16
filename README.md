@@ -15,6 +15,8 @@ Built with Rust, [GPUI](https://www.gpui.rs) and
 - Lives in the menu bar (macOS) or notification area (Windows, Linux): the
   icon shows whether the tunnel is on and switches connections. Closing the
   window keeps the app and the tunnel running; quit from the icon's menu.
+  On macOS the app has a Dock icon and a place in Cmd+Tab only while its
+  window is open.
 - Lists the proxies the admin granted. Changes on the server (a proxy granted,
   revoked or edited) reach the app at once; a revoked proxy drops the tunnel.
 - Lets you give a connection your own name. Only you see it, and it follows
@@ -25,7 +27,9 @@ Built with Rust, [GPUI](https://www.gpui.rs) and
   uses and how many bytes went through: no addresses, no DNS names. The
   server's backoffice shows who is online and the traffic.
 - English and Russian, light and dark; a fixed-size window.
-- Checks for a newer version, downloads and verifies it, and offers to install.
+- Checks for a newer version every six hours and from a button in Settings,
+  downloads and verifies it, says so in a system notification and offers to
+  install.
 
 ## Run from source
 

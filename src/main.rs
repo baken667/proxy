@@ -103,6 +103,10 @@ struct Shell {
     rename: Entity<InputState>,
     /// A newer version, already downloaded and verified.
     update: Option<update::Update>,
+    /// The check started from Settings is running.
+    checking_update: bool,
+    /// What that check found, when it was not an update.
+    update_note: SharedString,
     /// The logo mark, drawn for the light and for the dark theme.
     marks: [Arc<Image>; 2],
     current_password: Entity<InputState>,
@@ -148,12 +152,30 @@ impl Shell {
         cx.spawn(async move |this, cx| {
             while let Some(update) = updates.recv().await {
                 let _ = this.update(cx, |this, cx| {
+                    // Found in the background: say so even when the window is closed.
+                    let s = this.lang.strings();
+                    cx.show_system_notification(SystemNotification {
+                        tag: "update".into(),
+                        title: s.update_available.into(),
+                        body: fill(s.update_ready, &update.version).into(),
+                        actions: vec![SystemNotificationAction { id: "install".into(), label: s.install.into() }],
+                    });
                     this.update = Some(update);
                     cx.notify();
                 });
             }
         })
         .detach();
+        // A click on that notification brings the window back; its button opens the installer.
+        let (this, handle) = (cx.weak_entity(), window.window_handle());
+        cx.on_system_notification_response(move |response, cx| {
+            let _ = handle.update(cx, |_, window, cx| {
+                let _ = this.update(cx, |this, cx| match response.action_id {
+                    Some(_) => this.install(),
+                    None => this.tray_action(tray::Action::Open, window, cx),
+                });
+            });
+        });
 
         // The helper reports `up` / `down [reason]`; the UI just mirrors it.
         let (tunnel_states, mut states) = mpsc::unbounded_channel::<String>();
@@ -194,11 +216,14 @@ impl Shell {
         .detach();
 
         // Closing the window keeps the app (and the tunnel) running: the
-        // tray icon brings it back. macOS hides the app; elsewhere the window
-        // is minimized, as there is no hidden window state to return from.
+        // tray icon brings it back. macOS hides the app and takes it out of
+        // the Dock and the Cmd+Tab list (`foreground` puts it back); elsewhere
+        // the window is minimized, as there is no hidden window state to
+        // return from.
         window.on_window_should_close(cx, |window, cx| {
             if cfg!(target_os = "macos") {
                 cx.hide();
+                cx.set_activation_policy(ActivationPolicy::Accessory);
             } else {
                 window.minimize_window();
             }
@@ -253,6 +278,8 @@ impl Shell {
             renaming: None,
             rename,
             update: None,
+            checking_update: false,
+            update_note: "".into(),
             marks: [false, true].map(|dark| Arc::new(Image::from_bytes(ImageFormat::Svg, mark_svg(palette(dark))))),
             current_password,
             new_password,
@@ -352,7 +379,7 @@ impl Shell {
                             this.note = fill(this.lang.strings().session_not_saved, &error.to_string()).into();
                         }
                         this.signed_in(token, cx);
-                        cx.activate(true); // back from the browser
+                        foreground(cx); // back from the browser
                     }
                     Ok(Err(error)) => {
                         tracing::warn!("browser sign-in failed: {error:#}");
@@ -594,6 +621,42 @@ impl Shell {
         });
     }
 
+    // -------------------------------------------------------------- update
+
+    /// Hands the downloaded installer to the system.
+    fn install(&self) {
+        if let Some(update) = &self.update {
+            update::open(&update.installer);
+        }
+    }
+
+    /// The button in Settings: one check now, on top of the one every six hours.
+    fn check_update(&mut self, cx: &mut Context<Self>) {
+        if self.checking_update {
+            return;
+        }
+        self.checking_update = true;
+        self.update_note = "".into();
+        cx.spawn(async move |this, cx| {
+            let result = RT.spawn(update::check_now()).await;
+            let _ = this.update(cx, |this, cx| {
+                this.checking_update = false;
+                let s = this.lang.strings();
+                match result {
+                    Ok(Ok(Some(update))) => this.update = Some(update),
+                    Ok(Ok(None)) => this.update_note = s.up_to_date.into(),
+                    failed => {
+                        tracing::warn!("update check failed: {failed:?}");
+                        this.update_note = s.update_check_failed.into();
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     // ---------------------------------------------------------------- tray
 
     fn tray_state(&self) -> tray::State {
@@ -616,7 +679,7 @@ impl Shell {
     fn tray_action(&mut self, action: tray::Action, window: &mut Window, cx: &mut Context<Self>) {
         match action {
             tray::Action::Open => {
-                cx.activate(true);
+                foreground(cx);
                 window.activate_window();
             }
             tray::Action::Quit => cx.quit(),
@@ -779,11 +842,7 @@ impl Shell {
                             .gap(px(12.))
                             .pt(px(8.))
                             .child(div().flex_1().child(label(fill(s.update_ready, &update.version), p)))
-                            .child(button("install", s.install, Kind::Solid, true, cx).on_click(cx.listener(|this, _, _, _| {
-                                if let Some(update) = &this.update {
-                                    update::open(&update.installer);
-                                }
-                            })))
+                            .child(button("install", s.install, Kind::Solid, true, cx).on_click(cx.listener(|this, _, _, _| this.install())))
                     }))
                     .child(
                         v_flex()
@@ -916,6 +975,19 @@ impl Shell {
                             this.set_lang(lang, window, cx);
                         }))
                     }))))
+                    .child(block(s.updates, "", p).child(match &self.update {
+                        Some(update) => v_flex().gap(px(10.)).child(label(fill(s.update_ready, &update.version), p)).child(
+                            button("install-settings", s.install, Kind::Solid, false, cx).w_full().on_click(cx.listener(|this, _, _, _| this.install())),
+                        ),
+                        None => v_flex()
+                            .gap(px(10.))
+                            .child(
+                                button("check-updates", if self.checking_update { s.checking_updates } else { s.check_updates }, Kind::Default, false, cx)
+                                    .w_full()
+                                    .on_click(cx.listener(|this, _, _, cx| this.check_update(cx))),
+                            )
+                            .children((!self.update_note.is_empty()).then(|| label(self.update_note.clone(), p))),
+                    }))
                     .child(label(BUILD, p).mt(px(52.))),
             )
     }
@@ -1213,6 +1285,13 @@ fn pair(name: &'static str, value: String, p: Palette) -> Div {
 
 actions!(bkn_proxy, [Quit]);
 
+/// Brings the app to the front. On macOS it also returns it to the Dock and
+/// the Cmd+Tab list, which it left when its window was closed.
+fn foreground(cx: &mut App) {
+    cx.set_activation_policy(ActivationPolicy::Regular);
+    cx.activate(true);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if let [_, mode, port, token_file] = args.as_slice()
@@ -1239,10 +1318,12 @@ fn main() {
     tracing::info!(saved_session = saved_token.is_some(), "keychain read");
     let lang = Lang::load();
     let application = gpui_kit::application();
-    // macOS: a click on the Dock icon brings the hidden window back.
-    application.on_reopen(|cx| cx.activate(true));
+    // macOS: opening the app again while it runs in the background brings the window back.
+    application.on_reopen(foreground);
     application.run(move |cx| {
         gpui_kit::init(cx);
+        // Windows shows notifications only for an app that has named itself.
+        cx.set_app_identity("kz.bkn.proxy", "bkn-proxy");
         // Closing the window leaves the app running in the tray (see Shell::new).
         // Quit is in the tray menu, or Cmd+Q on macOS; quitting closes the
         // helper's connection, which tears the tunnel down.
@@ -1317,6 +1398,15 @@ mod tests {
             window.click("settings", cx);
             assert!(window.try_find("totp-setup").is_some());
             assert!(window.try_find("en").is_some() && window.try_find("ru").is_some(), "language switch");
+            // Settings offers a check until an update is there, then the install.
+            assert!(window.try_find("check-updates").is_some() && window.try_find("install-settings").is_none());
+            shell.update(cx, |shell, cx| {
+                shell.update = Some(crate::update::Update { version: "9.9.9".into(), installer: "bkn-proxy.dmg".into() });
+                cx.notify();
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("install-settings").is_some() && window.try_find("check-updates").is_none());
+            shell.update(cx, |shell, _| shell.update = None);
             window.click("back", cx);
             assert!(window.try_find("settings").is_some());
 

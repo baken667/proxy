@@ -112,6 +112,8 @@ pub struct Strings {
     /// `{}` is a version number.
     pub update_ready: &'static str,
     pub install: &'static str,
+    /// The title of the system notification about a new version.
+    pub update_available: &'static str,
 
     // Settings
     pub back: &'static str,
@@ -133,6 +135,11 @@ pub struct Strings {
     pub change_password: &'static str,
     pub password_changed: &'static str,
     pub language: &'static str,
+    pub updates: &'static str,
+    pub check_updates: &'static str,
+    pub checking_updates: &'static str,
+    pub up_to_date: &'static str,
+    pub update_check_failed: &'static str,
     pub network: &'static str,
     pub network_hint: &'static str,
     pub repair_network: &'static str,
@@ -221,6 +228,7 @@ const EN: Strings = Strings {
     cancel: "Cancel",
     update_ready: "Version {} is downloaded",
     install: "Install",
+    update_available: "Update available",
 
     back: "Back",
     account: "Account",
@@ -241,6 +249,11 @@ const EN: Strings = Strings {
     change_password: "Change password",
     password_changed: "Password changed. Your other devices were signed out.",
     language: "Language",
+    updates: "Updates",
+    check_updates: "Check for updates",
+    checking_updates: "Checking…",
+    up_to_date: "You have the latest version",
+    update_check_failed: "Could not check for updates",
     network: "Network",
     network_hint: "If the internet stops working after a disconnect or a crash, this puts the device's DNS and routes back. Asks for the administrator password.",
     repair_network: "Repair network",
@@ -305,6 +318,7 @@ const RU: Strings = Strings {
     cancel: "Отмена",
     update_ready: "Версия {} загружена",
     install: "Установить",
+    update_available: "Доступно обновление",
 
     back: "Назад",
     account: "Аккаунт",
@@ -325,6 +339,11 @@ const RU: Strings = Strings {
     change_password: "Сменить пароль",
     password_changed: "Пароль изменён. На других устройствах выполнен выход.",
     language: "Язык",
+    updates: "Обновления",
+    check_updates: "Проверить обновления",
+    checking_updates: "Проверяю…",
+    up_to_date: "У вас последняя версия",
+    update_check_failed: "Не удалось проверить обновления",
     network: "Сеть",
     network_hint: "Если после отключения или сбоя пропал интернет, это вернёт DNS и маршруты устройства. Спросит пароль администратора.",
     repair_network: "Починить сеть",

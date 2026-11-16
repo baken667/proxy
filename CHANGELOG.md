@@ -4,6 +4,12 @@ What changed in each release of the bkn-proxy desktop app. The section for a
 version becomes the notes of its GitHub release, where a line break inside a
 paragraph shows as one: keep each entry on a single line.
 
+## 0.2.3 — 2026-11-17
+
+- macOS: closing the window takes the app out of the Dock and the Cmd+Tab list. It stays in the menu bar: Open bkn-proxy there, or opening the app again, brings the window and the Dock icon back.
+- A system notification says when a new version has been downloaded; its Install button opens the installer, a click on the notification opens the window.
+- Settings has a Check for updates button.
+
 ## 0.2.2 — 2026-11-16
 
 - macOS no longer asks for the keychain password at every launch. The saved session now has a keychain entry of its own per server, so a development build and the installed app no longer take turns locking each other out of one shared entry. Sign in once more after updating: the old entry is not carried over.
