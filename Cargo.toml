@@ -1,8 +1,10 @@
 [package]
 name = "bkn-proxy"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2024"
 description = "Desktop app that routes the whole device through a SOCKS5 proxy"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/baken667/proxy"
 publish = false
 
 [dependencies]

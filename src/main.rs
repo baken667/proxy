@@ -16,8 +16,9 @@ use std::{
 };
 
 use gpui_kit::{
+    assets::IconName,
     component::{
-        ActiveTheme, Theme,
+        ActiveTheme, Icon, Theme,
         button::{Button, ButtonCustomVariant, ButtonVariants},
         chart::AreaChart,
         h_flex,
@@ -57,11 +58,22 @@ fn keychain() -> Option<keyring::Entry> {
 /// "bkn-proxy 0.2.2 · a1b2c3d": the version and the commit it was built from.
 const BUILD: &str = concat!("bkn-proxy ", env!("CARGO_PKG_VERSION"), " · ", env!("BKN_COMMIT"));
 
+/// JetBrains Mono Medium, the wordmark's typeface: in the window and on the
+/// page the browser shows after sign-in.
+const FONT: &[u8] = include_bytes!("../assets/JetBrainsMono-Medium.ttf");
+
 #[derive(PartialEq)]
 enum Screen {
     Login,
     Proxies,
     Settings,
+}
+
+/// A setting whose fields are open under its row.
+#[derive(Clone, Copy, PartialEq)]
+enum Panel {
+    Password,
+    TotpOff,
 }
 
 #[derive(PartialEq)]
@@ -89,6 +101,7 @@ struct Shell {
     /// The browser sign-in in progress; dropping it does not stop it, aborting does.
     signing_in: Option<tokio::task::AbortHandle>,
     totp_setup: Option<TotpSetup>,
+    open: Option<Panel>,
     tunnel: Option<Tunnel>,
     launching: bool,
     /// A repair is waiting for the helper to start.
@@ -124,7 +137,7 @@ impl Shell {
     fn new(saved_token: Option<String>, lang: Lang, window: &mut Window, cx: &mut Context<Self>) -> Self {
         apply_theme(window, cx);
         // The wordmark's typeface; everything else is the system font.
-        let _ = cx.text_system().add_fonts(vec![Cow::Borrowed(include_bytes!("../assets/JetBrainsMono-Medium.ttf"))]);
+        let _ = cx.text_system().add_fonts(vec![Cow::Borrowed(FONT)]);
         gpui_kit::component::set_locale(lang.code());
         let s = lang.strings();
         let mut input = |placeholder: &'static str, masked: bool| {
@@ -268,6 +281,7 @@ impl Shell {
             info: "".into(),
             signing_in: None,
             totp_setup: None,
+            open: None,
             tunnel: None,
             launching: false,
             pending_repair: false,
@@ -450,6 +464,7 @@ impl Shell {
         self.me = None;
         self.proxies.clear();
         self.totp_setup = None;
+        self.open = None;
         self.refresh = None;
         self._sync = None;
         self.screen = Screen::Login;
@@ -553,9 +568,9 @@ impl Shell {
             return;
         }
         self.launching = true;
-        let states = self.tunnel_states.clone();
+        let (states, prompt) = (self.tunnel_states.clone(), self.lang.strings().admin_prompt);
         cx.spawn(async move |this, cx| {
-            let result = RT.spawn(Tunnel::launch(states)).await;
+            let result = RT.spawn(Tunnel::launch(states, prompt)).await;
             let _ = this.update(cx, |this, cx| {
                 this.launching = false;
                 match result {
@@ -630,7 +645,7 @@ impl Shell {
         }
     }
 
-    /// The button in Settings: one check now, on top of the one every six hours.
+    /// The button in Settings: one check now, on top of the hourly one.
     fn check_update(&mut self, cx: &mut Context<Self>) {
         if self.checking_update {
             return;
@@ -692,20 +707,36 @@ impl Shell {
 
     // ------------------------------------------------------------- screens
 
-    /// A line that asks for attention. Signal colour, and always worded as a
-    /// problem so it is never colour alone.
+    /// What went wrong, or failing that what went right, as one line with an
+    /// icon: never colour alone.
     fn note(&self, p: Palette) -> Option<Div> {
-        if !self.note.is_empty() {
-            Some(div().text_size(px(15.)).text_color(p.signal).child(self.note.clone()))
+        let (text, tone, name) = if !self.note.is_empty() {
+            (&self.note, Tone::Danger, IconName::CircleAlert)
         } else if !self.info.is_empty() {
-            Some(label(self.info.clone(), p))
+            (&self.info, Tone::Success, IconName::CircleCheck)
         } else {
-            None
-        }
+            return None;
+        };
+        let color = p.tone(tone);
+        Some(
+            h_flex()
+                .items_start()
+                .gap(px(8.))
+                .text_size(px(SMALL))
+                .text_color(color)
+                // 3px: the icon sits on the first line's middle, not on the box's top.
+                .child(div().pt(px(3.)).child(icon(name, 14., color)))
+                .child(div().flex_1().overflow_hidden().child(text.clone())),
+        )
     }
 
     fn mark(&self, p: Palette, size: f32) -> Img {
         img(self.marks[p.dark as usize].clone()).size(px(size))
+    }
+
+    /// The logo and the name, as the sign-in screens show them.
+    fn brand(&self, p: Palette) -> Div {
+        h_flex().items_center().gap(px(12.)).mb(px(6.)).child(self.mark(p, 56.)).child(wordmark(p, 24.))
     }
 
     fn login_screen(&self, p: Palette, cx: &mut Context<Self>) -> Div {
@@ -714,17 +745,22 @@ impl Shell {
         v_flex()
             .size_full()
             .justify_center()
-            .gap(px(10.))
-            .child(h_flex().items_center().gap(px(14.)).child(self.mark(p, 72.)).child(wordmark(p, 30.)))
+            .gap(px(8.))
+            .child(self.brand(p))
             .child(label(s.login_hint, p))
-            .child(label(s.sign_in_hint, p).mb(px(10.)))
+            .child(label(s.sign_in_hint, p).mb(px(8.)))
             .child(if waiting {
                 v_flex()
                     .gap(px(10.))
-                    .child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child(s.waiting_browser))
+                    .child(heading(s.waiting_browser))
                     .child(button("cancel-sign-in", s.cancel, Kind::Default, false, cx).w_full().on_click(cx.listener(|this, _, _, cx| this.cancel_sign_in(cx))))
             } else {
-                v_flex().child(button("login", s.sign_in, Kind::Solid, false, cx).w_full().on_click(cx.listener(|this, _, _, cx| this.sign_in(cx))))
+                v_flex().child(
+                    button("login", s.sign_in, Kind::Solid, false, cx)
+                        .icon(Icon::new(IconName::ExternalLink))
+                        .w_full()
+                        .on_click(cx.listener(|this, _, _, cx| this.sign_in(cx))),
+                )
             })
             .children(self.note(p))
     }
@@ -736,12 +772,15 @@ impl Shell {
         v_flex()
             .size_full()
             .justify_center()
-            .gap(px(10.))
-            .child(h_flex().items_center().gap(px(14.)).child(self.mark(p, 72.)).child(wordmark(p, 30.)))
-            .child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child(s.checking_session))
+            .gap(px(8.))
+            .child(self.brand(p))
+            .child(heading(s.checking_session))
             .children(self.note(p))
-            .child(div().mt(px(10.)).child(
-                button("logout", s.sign_out, Kind::Default, false, cx).w_full().on_click(cx.listener(|this, _, window, cx| this.log_out(window, cx))),
+            .child(div().mt(px(8.)).child(
+                button("logout", s.sign_out, Kind::Default, false, cx)
+                    .icon(Icon::new(IconName::LogOut))
+                    .w_full()
+                    .on_click(cx.listener(|this, _, window, cx| this.log_out(window, cx))),
             ))
     }
 
@@ -749,10 +788,10 @@ impl Shell {
         let s = self.lang.strings();
         let active = self.active.and_then(|id| self.proxies.iter().find(|proxy| proxy.id == id));
         // The one loud word: what is happening to this device's traffic.
-        let (state, phrase) = match (&self.link, active) {
-            (Link::On, Some(proxy)) => (s.connected, proxy.name.clone()),
-            (Link::Connecting, Some(proxy)) => (s.connecting, proxy.name.clone()),
-            _ => (s.off, s.direct.to_string()),
+        let (state, phrase, ink) = match (&self.link, active) {
+            (Link::On, Some(proxy)) => (s.connected, proxy.name.clone(), p.tone(Tone::Success)),
+            (Link::Connecting, Some(proxy)) => (s.connecting, proxy.name.clone(), p.ink_2),
+            _ => (s.off, s.direct.to_string(), p.ink),
         };
         let email = self.me.as_ref().map(|me| me.email.clone()).unwrap_or_default();
 
@@ -761,7 +800,7 @@ impl Shell {
             if self.renaming == Some(id) {
                 return v_flex()
                     .gap(px(8.))
-                    .py(px(9.))
+                    .py(px(6.))
                     .child(field(&self.rename, p))
                     .child(label(s.rename_hint, p))
                     .child(
@@ -781,7 +820,7 @@ impl Shell {
             h_flex()
                 .items_center()
                 .gap(px(4.))
-                .py(px(9.))
+                .py(px(6.))
                 .child(
                     v_flex()
                         .flex_1()
@@ -791,14 +830,19 @@ impl Shell {
                         .child(label(host(&proxy.url).to_string(), p)),
                 )
                 .child(
-                    button(SharedString::from(format!("rename-{id}")), s.rename, Kind::Quiet, true, cx)
+                    icon_button(SharedString::from(format!("rename-{id}")), IconName::Pencil, s.rename, cx)
                         .on_click(cx.listener(move |this, _, window, cx| this.start_rename(id, window, cx))),
                 )
                 .child(if is_active {
-                    div()
-                        .text_size(px(15.))
+                    h_flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .pl(px(6.))
+                        .text_size(px(SMALL))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child(if self.link == Link::On { s.connected } else { s.connecting })
+                        .text_color(ink)
+                        .when(self.link == Link::On, |el| el.child(icon(IconName::Check, 14., ink)))
+                        .child(state)
                         .into_any_element()
                 } else {
                     button(SharedString::from(format!("connect-{id}")), s.connect, Kind::Default, true, cx)
@@ -811,20 +855,20 @@ impl Shell {
             .size_full()
             .child(
                 h_flex()
-                    .items_start()
+                    .items_center()
                     .justify_between()
-                    .gap(px(16.))
-                    .pb(px(8.))
+                    .gap(px(12.))
+                    .pb(px(4.))
                     .child(
                         h_flex()
                             .flex_1()
                             .overflow_hidden()
                             .items_center()
                             .gap(px(10.))
-                            .child(self.mark(p, 44.))
-                            .child(v_flex().child(wordmark(p, 18.)).child(label(email, p))),
+                            .child(self.mark(p, 34.))
+                            .child(v_flex().child(wordmark(p, 16.)).child(label(email, p))),
                     )
-                    .child(button("settings", s.settings, Kind::Quiet, true, cx).mr(px(-14.)).on_click(cx.listener(|this, _, _, cx| {
+                    .child(icon_button("settings", IconName::Settings, s.settings, cx).mr(px(-7.)).on_click(cx.listener(|this, _, _, cx| {
                         this.screen = Screen::Settings;
                         this.note = "".into();
                         cx.notify();
@@ -835,35 +879,29 @@ impl Shell {
                     .id("pane")
                     .flex_1()
                     .overflow_y_scroll()
-                    .pb(px(40.))
-                    .children(self.update.as_ref().map(|update| {
-                        h_flex()
-                            .items_center()
-                            .gap(px(12.))
-                            .pt(px(8.))
-                            .child(div().flex_1().child(label(fill(s.update_ready, &update.version), p)))
-                            .child(button("install", s.install, Kind::Solid, true, cx).on_click(cx.listener(|this, _, _, _| this.install())))
-                    }))
+                    .pb(px(16.))
                     .child(
                         v_flex()
-                            .pt(px(28.))
-                            .pb(px(8.))
-                            .child(figure(state))
-                            .child(div().mt(px(14.)).text_size(px(20.)).line_height(relative(1.3)).font_weight(FontWeight::SEMIBOLD).child(phrase))
+                            .pt(px(14.))
+                            .child(figure(state, ink))
+                            .child(heading(phrase).mt(px(8.)))
                             .children(self.traffic.as_ref().map(|traffic| label(fill(s.for_time, &clock(traffic.since.elapsed().as_secs())), p)))
                             .children(self.note(p).map(|note| note.mt(px(6.)))),
                     )
                     .children(self.traffic.as_ref().map(|traffic| traffic_figure(traffic, p, s)))
                     .when(self.active.is_some(), |el| {
-                        el.child(div().mt(px(20.)).child(
-                            button("disconnect", s.disconnect, Kind::Default, false, cx).w_full().on_click(cx.listener(|this, _, _, cx| {
-                                this.disconnect();
-                                cx.notify();
-                            })),
+                        el.child(div().mt(px(14.)).child(
+                            button("disconnect", s.disconnect, Kind::Tinted(Tone::Danger), false, cx)
+                                .icon(Icon::new(IconName::Power))
+                                .w_full()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.disconnect();
+                                    cx.notify();
+                                })),
                         ))
                     })
                     .child(
-                        block(s.proxies, self.proxies.len().to_string(), p)
+                        group(s.proxies, self.proxies.len().to_string(), p)
                             .when(self.proxies.is_empty(), |el| el.child(label(s.none_yet, p)))
                             .children(rows),
                     ),
@@ -873,122 +911,149 @@ impl Shell {
     fn settings_screen(&self, p: Palette, cx: &mut Context<Self>) -> Div {
         let s = self.lang.strings();
         let (email, totp_enabled) = self.me.as_ref().map(|me| (me.email.clone(), me.totp_enabled)).unwrap_or_default();
+        // A button that opens the fields under its row, or closes them again.
+        let toggle = |id: &'static str, text: &'static str, panel: Panel, cx: &mut Context<Self>| {
+            let open = self.open == Some(panel);
+            button(id, if open { s.cancel } else { text }, Kind::Default, true, cx).on_click(cx.listener(move |this, _, window, cx| {
+                this.open = (!open).then_some(panel);
+                this.note = "".into();
+                this.info = "".into();
+                Self::clear(&[&this.current_password, &this.new_password, &this.totp_code], window, cx);
+                cx.notify();
+            }))
+        };
 
-        let two_factor = block(s.two_factor, if totp_enabled { s.two_factor_on } else { s.two_factor_off }, p).child(if totp_enabled {
-            v_flex()
-                .gap(px(10.))
-                .child(label(s.turn_off_hint, p))
-                .child(field(&self.totp_code, p))
-                .child(
-                    button("totp-off", s.turn_off, Kind::Default, false, cx)
+        let two_factor = if totp_enabled {
+            let ask = self.open == Some(Panel::TotpOff);
+            let panel = ask.then(|| {
+                v_flex().gap(px(8.)).child(label(s.turn_off_hint, p)).child(field(&self.totp_code, p)).child(
+                    button("totp-off-confirm", s.turn_off, Kind::Tinted(Tone::Danger), false, cx)
                         .w_full()
                         .on_click(cx.listener(|this, _, window, cx| this.totp_switch("disable", window, cx))),
                 )
+            });
+            under(setting(IconName::ShieldCheck, s.two_factor, s.two_factor_on, p).child(toggle("totp-off", s.turn_off, Panel::TotpOff, cx)), panel)
         } else if let Some(setup) = &self.totp_setup {
-            let secret = setup.secret.clone();
-            let url = setup.otpauth_url.clone();
-            v_flex()
-                .gap(px(10.))
+            let (secret, url) = (setup.secret.clone(), setup.otpauth_url.clone());
+            let copy = |id: &'static str, text: &'static str, value: String, cx: &mut Context<Self>| {
+                button(id, text, Kind::Default, true, cx).icon(Icon::new(IconName::Copy)).on_click(cx.listener(move |this, _, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(value.clone()));
+                    this.note = "".into();
+                    this.info = this.lang.strings().copied.into();
+                    cx.notify();
+                }))
+            };
+            let row = setting(IconName::ShieldCheck, s.two_factor, s.two_factor_off, p).child(
+                button("totp-cancel", s.cancel, Kind::Default, true, cx).on_click(cx.listener(|this, _, _, cx| {
+                    this.totp_setup = None;
+                    this.info = "".into();
+                    cx.notify();
+                })),
+            );
+            let panel = v_flex()
+                .gap(px(8.))
                 .child(label(s.set_up_hint, p))
-                .child(div().font_family("Menlo").text_size(px(15.)).child(secret.clone()))
-                .child(
-                    h_flex()
-                        .gap(px(8.))
-                        .child(button("copy-key", s.copy_key, Kind::Default, true, cx).on_click(move |_, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(secret.clone()));
-                        }))
-                        .child(button("copy-url", s.copy_link, Kind::Default, true, cx).on_click(move |_, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
-                        })),
-                )
+                .child(div().font_family("Menlo").text_size(px(SMALL)).child(secret.clone()))
+                .child(h_flex().gap(px(8.)).child(copy("copy-key", s.copy_key, secret, cx)).child(copy("copy-url", s.copy_link, url, cx)))
                 .child(field(&self.totp_code, p))
                 .child(
                     button("totp-on", s.turn_on, Kind::Solid, false, cx)
                         .w_full()
                         .on_click(cx.listener(|this, _, window, cx| this.totp_switch("enable", window, cx))),
-                )
+                );
+            under(row, Some(panel))
         } else {
-            v_flex().child(button("totp-setup", s.set_up, Kind::Default, false, cx).w_full().on_click(cx.listener(|this, _, window, cx| {
-                this.call(Method::POST, "/me/totp/setup", None, window, cx, |this, setup: TotpSetup, _, _| this.totp_setup = Some(setup));
-            })))
-        });
+            setting(IconName::ShieldCheck, s.two_factor, s.two_factor_off, p).child(
+                button("totp-setup", s.set_up, Kind::Default, true, cx).on_click(cx.listener(|this, _, window, cx| {
+                    this.call(Method::POST, "/me/totp/setup", None, window, cx, |this, setup: TotpSetup, _, _| this.totp_setup = Some(setup));
+                })),
+            )
+        };
+
+        let password = under(
+            setting(IconName::Lock, s.password, "", p).child(toggle("password", s.change, Panel::Password, cx)),
+            (self.open == Some(Panel::Password)).then(|| {
+                v_flex().gap(px(8.)).child(field(&self.current_password, p)).child(field(&self.new_password, p)).child(
+                    button("password-save", s.change_password, Kind::Solid, false, cx).w_full().on_click(cx.listener(|this, _, window, cx| {
+                        let body = json!({ "current": Self::value(&this.current_password, cx), "new": Self::value(&this.new_password, cx) });
+                        this.call(Method::POST, "/me/password", Some(body), window, cx, |this, _: (), window, cx| {
+                            Self::clear(&[&this.current_password, &this.new_password], window, cx);
+                            this.open = None;
+                            this.info = this.lang.strings().password_changed.into();
+                        });
+                    })),
+                )
+            }),
+        );
+
+        let updates = match &self.update {
+            Some(update) => setting(IconName::Download, s.updates, fill(s.update_ready, &update.version), p)
+                .child(button("install-settings", s.install, Kind::Solid, true, cx).on_click(cx.listener(|this, _, _, _| this.install()))),
+            None => {
+                let status = if self.update_note.is_empty() { SharedString::from(BUILD) } else { self.update_note.clone() };
+                setting(IconName::Download, s.updates, status, p).child(
+                    button("check-updates", if self.checking_update { s.checking_updates } else { s.check_updates }, Kind::Default, true, cx)
+                        .on_click(cx.listener(|this, _, _, cx| this.check_update(cx))),
+                )
+            }
+        };
 
         v_flex()
             .size_full()
             .child(
-                h_flex().pb(px(8.)).child(button("back", s.back, Kind::Quiet, true, cx).ml(px(-14.)).on_click(cx.listener(|this, _, _, cx| {
-                    this.screen = Screen::Proxies;
-                    this.note = "".into();
-                    this.info = "".into();
-                    cx.notify();
-                }))),
+                h_flex().pb(px(4.)).child(
+                    button("back", s.back, Kind::Quiet, true, cx).icon(Icon::new(IconName::ArrowLeft)).ml(px(-10.)).on_click(cx.listener(|this, _, _, cx| {
+                        this.screen = Screen::Proxies;
+                        this.open = None;
+                        this.note = "".into();
+                        this.info = "".into();
+                        cx.notify();
+                    })),
+                ),
             )
             .child(
                 v_flex()
                     .id("settings-pane")
                     .flex_1()
                     .overflow_y_scroll()
-                    .pb(px(40.))
+                    .pb(px(16.))
                     .children(self.note(p))
                     .child(
-                        block(s.account, "", p).mt(px(20.)).child(pair(s.signed_in_as, email, p)).child(div().mt(px(16.)).child(
-                            button("logout", s.sign_out, Kind::Default, false, cx).w_full().on_click(cx.listener(|this, _, window, cx| this.log_out(window, cx))),
-                        )),
+                        group(s.account, "", p).mt(px(8.)).child(
+                            setting(IconName::User, email, "", p).child(
+                                button("logout", s.sign_out, Kind::Tinted(Tone::Danger), true, cx)
+                                    .icon(Icon::new(IconName::LogOut))
+                                    .on_click(cx.listener(|this, _, window, cx| this.log_out(window, cx))),
+                            ),
+                        ),
                     )
-                    .child(two_factor)
                     .child(
-                        block(s.passkeys, "", p).child(
-                            v_flex().gap(px(10.)).child(label(s.passkeys_hint, p)).child(
-                                button("passkeys", s.manage_in_browser, Kind::Default, false, cx)
-                                    .w_full()
+                        group(s.security, "", p).child(two_factor).child(password).child(
+                            setting(IconName::KeyRound, s.passkeys, s.passkeys_hint, p).child(
+                                button("passkeys", s.manage_in_browser, Kind::Default, true, cx)
+                                    .icon(Icon::new(IconName::ExternalLink))
                                     .on_click(|_, _, _| update::open_external(format!("{}/account", api::base()))),
                             ),
                         ),
                     )
                     .child(
-                        block(s.password, "", p).child(
-                            v_flex().gap(px(10.)).child(field(&self.current_password, p)).child(field(&self.new_password, p)).child(
-                                button("password", s.change_password, Kind::Default, false, cx).w_full().on_click(cx.listener(|this, _, window, cx| {
-                                    let body = json!({ "current": Self::value(&this.current_password, cx), "new": Self::value(&this.new_password, cx) });
-                                    this.call(Method::POST, "/me/password", Some(body), window, cx, |this, _: (), window, cx| {
-                                        Self::clear(&[&this.current_password, &this.new_password], window, cx);
-                                        this.info = this.lang.strings().password_changed.into();
-                                    });
-                                })),
-                            ),
-                        ),
-                    )
-                    .child(
-                        block(s.network, "", p).child(
-                            v_flex().gap(px(10.)).child(label(s.network_hint, p)).child(
-                                button("repair", if self.repairing { s.repairing } else { s.repair_network }, Kind::Default, false, cx)
-                                    .w_full()
-                                    .on_click(cx.listener(|this, _, _, cx| this.repair_network(cx))),
-                            ),
-                        ),
-                    )
-                    .child(block(s.language, "", p).child(h_flex().gap(px(8.)).children(Lang::ALL.map(|lang| {
-                        // The current language is the ink-filled one.
-                        let kind = if lang == self.lang { Kind::Solid } else { Kind::Default };
-                        button(lang.code(), lang.strings().name, kind, true, cx).on_click(cx.listener(move |this, _, window, cx| {
-                            lang.save();
-                            this.set_lang(lang, window, cx);
-                        }))
-                    }))))
-                    .child(block(s.updates, "", p).child(match &self.update {
-                        Some(update) => v_flex().gap(px(10.)).child(label(fill(s.update_ready, &update.version), p)).child(
-                            button("install-settings", s.install, Kind::Solid, false, cx).w_full().on_click(cx.listener(|this, _, _, _| this.install())),
-                        ),
-                        None => v_flex()
-                            .gap(px(10.))
+                        group(s.app, "", p)
+                            .child(setting(IconName::Languages, s.language, "", p).child(h_flex().gap(px(6.)).children(Lang::ALL.map(|lang| {
+                                // The current language is the ink-filled one.
+                                let kind = if lang == self.lang { Kind::Solid } else { Kind::Default };
+                                button(lang.code(), lang.strings().name, kind, true, cx).on_click(cx.listener(move |this, _, window, cx| {
+                                    lang.save();
+                                    this.set_lang(lang, window, cx);
+                                }))
+                            }))))
                             .child(
-                                button("check-updates", if self.checking_update { s.checking_updates } else { s.check_updates }, Kind::Default, false, cx)
-                                    .w_full()
-                                    .on_click(cx.listener(|this, _, _, cx| this.check_update(cx))),
+                                setting(IconName::Wrench, s.network, s.network_hint, p).child(
+                                    button("repair", if self.repairing { s.repairing } else { s.repair_network }, Kind::Default, true, cx)
+                                        .on_click(cx.listener(|this, _, _, cx| this.repair_network(cx))),
+                                ),
                             )
-                            .children((!self.update_note.is_empty()).then(|| label(self.update_note.clone(), p))),
-                    }))
-                    .child(label(BUILD, p).mt(px(52.))),
+                            .child(updates),
+                    ),
             )
     }
 
@@ -997,6 +1062,7 @@ impl Shell {
         self.call(Method::POST, format!("/me/totp/{action}"), Some(body), window, cx, |this, _: (), window, cx| {
             Self::clear(&[&this.totp_code], window, cx);
             this.totp_setup = None;
+            this.open = None;
             this.poke(); // refetch /me for the new 2FA state
         });
     }
@@ -1017,28 +1083,27 @@ impl Render for Shell {
             Screen::Settings => self.settings_screen(p, cx),
         };
         let s = self.lang.strings();
-        let banner = (self.leftovers && self.screen != Screen::Settings).then(|| {
-            v_flex()
-                .items_start()
-                .gap(px(8.))
-                .pb(px(16.))
-                .child(div().w_full().text_size(px(15.)).text_color(p.signal).child(s.leftovers_found))
-                .child(
-                    button("repair-banner", if self.repairing { s.repairing } else { s.repair_network }, Kind::Solid, true, cx)
-                        .on_click(cx.listener(|this, _, _, cx| this.repair_network(cx))),
-                )
+        // Ribbons across the top of every screen. They are part of the layout,
+        // so the screen below starts under them instead of being covered.
+        let update = self.update.as_ref().map(|update| {
+            ribbon(Tone::Info, IconName::Download, fill(s.update_ready, &update.version), p)
+                .child(button("install", s.install, Kind::Filled(Tone::Info), true, cx).on_click(cx.listener(|this, _, _, _| this.install())))
+        });
+        let leftovers = self.leftovers.then(|| {
+            ribbon(Tone::Warning, IconName::TriangleAlert, s.leftovers_found, p).child(
+                button("repair-banner", if self.repairing { s.repairing } else { s.repair_network }, Kind::Filled(Tone::Warning), true, cx)
+                    .on_click(cx.listener(|this, _, _, cx| this.repair_network(cx))),
+            )
         });
         v_flex()
             .size_full()
-            .px(px(24.))
-            .pt(px(20.))
-            .pb(px(12.))
             .bg(p.ground)
             .text_color(p.ink)
-            .text_size(px(17.))
-            .line_height(relative(1.45))
-            .children(banner)
-            .child(body.flex_1())
+            .text_size(px(TEXT))
+            .line_height(relative(1.4))
+            .children(update)
+            .children(leftovers)
+            .child(body.flex_1().px(px(20.)).pt(px(14.)).pb(px(8.)))
     }
 }
 
@@ -1108,10 +1173,15 @@ fn clock(seconds: u64) -> String {
 
 // ------------------------------------------------------------------- design
 //
-// The system from Codwheel's DESIGN.md: one flat ground, ink, a label grey and
-// a single signal colour that means "look here". No cards, borders or shadows;
-// structure is space and weight. A fill sits only behind what is pressed or
-// typed into.
+// One flat ground, ink and a label grey; structure is space and weight, with
+// no cards, borders or shadows. A fill sits only behind what is pressed or
+// typed into. `signal` is the brand's own colour (the logo, the caret). What
+// a colour *says* is a `Tone`, and a tone never comes alone: there is always
+// an icon or a word with it.
+
+/// Text sizes: the body, and the small one of labels, hints and small buttons.
+const TEXT: f32 = 15.;
+const SMALL: f32 = 13.;
 
 #[derive(Clone, Copy)]
 struct Palette {
@@ -1120,15 +1190,64 @@ struct Palette {
     ink: Hsla,
     ink_2: Hsla,
     signal: Hsla,
+    danger: Hsla,
+    warning: Hsla,
+    success: Hsla,
+    info: Hsla,
     dark: bool,
 }
 
+/// What a colour says: something failed or destroys, needs attention, went
+/// well, or is simply news.
+#[derive(Clone, Copy)]
+enum Tone {
+    Danger,
+    Warning,
+    Success,
+    Info,
+}
+
+impl Palette {
+    fn tone(self, tone: Tone) -> Hsla {
+        match tone {
+            Tone::Danger => self.danger,
+            Tone::Warning => self.warning,
+            Tone::Success => self.success,
+            Tone::Info => self.info,
+        }
+    }
+}
+
+/// Every tone reads at 4.5:1 or better as text on the ground and on its own
+/// 14% tint, and the ground reads on it as a fill.
 fn palette(dark: bool) -> Palette {
     let c = |hex: u32| Hsla::from(rgb(hex));
     if dark {
-        Palette { ground: c(0x1e1e1d), ground_2: c(0x2b2b29), ink: c(0xf1f1ee), ink_2: c(0xa2a29d), signal: c(0xff6a2b), dark }
+        Palette {
+            ground: c(0x1e1e1d),
+            ground_2: c(0x2b2b29),
+            ink: c(0xf1f1ee),
+            ink_2: c(0xa2a29d),
+            signal: c(0xff6a2b),
+            danger: c(0xff6b6b),
+            warning: c(0xf2b441),
+            success: c(0x5fd08a),
+            info: c(0x6aa9ff),
+            dark,
+        }
     } else {
-        Palette { ground: c(0xe8e8e6), ground_2: c(0xdcdcd9), ink: c(0x191918), ink_2: c(0x5c5c59), signal: c(0xb53604), dark }
+        Palette {
+            ground: c(0xe8e8e6),
+            ground_2: c(0xdcdcd9),
+            ink: c(0x191918),
+            ink_2: c(0x5c5c59),
+            signal: c(0xb53604),
+            danger: c(0xa61b27),
+            warning: c(0x7d4a00),
+            success: c(0x17633a),
+            info: c(0x114f9f),
+            dark,
+        }
     }
 }
 
@@ -1150,6 +1269,17 @@ fn apply_palette(cx: &mut App) {
     theme.ring = p.ink;
 }
 
+// Icons are Lucide (lucide.dev), which gpui-kit bundles. Only the ones named
+// here are built into the app.
+gpui_kit::assets::icon_assets!(
+    Icons,
+    [ArrowLeft, Check, CircleAlert, CircleCheck, Copy, Download, ExternalLink, KeyRound, Languages, Lock, LogOut, Pencil, Power, Settings, ShieldCheck, TriangleAlert, User, Wrench]
+);
+
+fn icon(name: IconName, size: f32, color: Hsla) -> Icon {
+    Icon::new(name).size(px(size)).text_color(color)
+}
+
 #[derive(Clone, Copy)]
 enum Kind {
     /// Pressed grey: neutral actions.
@@ -1158,9 +1288,14 @@ enum Kind {
     Solid,
     /// No fill.
     Quiet,
+    /// A tone's tint under the tone itself: an action that takes something away.
+    Tinted(Tone),
+    /// A tone as the fill: the action of a ribbon in that tone.
+    Filled(Tone),
 }
 
-/// 52px tall with a 16px radius, or `small`: 44px with 12px. No hover style.
+/// 40px tall with a 12px radius, or `small`: 30px with 8px. The library sets
+/// the text at 14px in both. No hover style.
 /// A quiet button keeps its padding as hit area; callers pull it back with a
 /// negative margin where its text should line up with the gutter.
 fn button(id: impl Into<ElementId>, text: &'static str, kind: Kind, small: bool, cx: &App) -> Button {
@@ -1169,8 +1304,10 @@ fn button(id: impl Into<ElementId>, text: &'static str, kind: Kind, small: bool,
         Kind::Default => (p.ground_2, p.ink),
         Kind::Solid => (p.ink, p.ground),
         Kind::Quiet => (transparent_black(), if small { p.ink_2 } else { p.ink }),
+        Kind::Tinted(tone) => (p.tone(tone).opacity(0.14), p.tone(tone)),
+        Kind::Filled(tone) => (p.tone(tone), p.ground),
     };
-    let (height, pad, radius, size, weight) = if small { (44., 14., 12., 15., FontWeight::MEDIUM) } else { (52., 20., 16., 17., FontWeight::SEMIBOLD) };
+    let (height, pad, radius, weight) = if small { (30., 10., 8., FontWeight::MEDIUM) } else { (40., 16., 12., FontWeight::SEMIBOLD) };
     Button::new(id)
         .custom(ButtonCustomVariant::new(cx).color(fill).foreground(ink).hover(fill).active(fill))
         .rounded(px(radius))
@@ -1179,12 +1316,25 @@ fn button(id: impl Into<ElementId>, text: &'static str, kind: Kind, small: bool,
         .bg(fill)
         .h(px(height))
         .px(px(pad))
-        .text_size(px(size))
         .font_weight(weight)
 }
 
+/// A 30px button that is only an icon. `name` is what it does, for the
+/// tooltip and for screen readers. The one button with a hover fill, as it
+/// has none at rest.
+fn icon_button(id: impl Into<ElementId>, glyph: IconName, name: &'static str, cx: &App) -> Button {
+    let p = palette(cx.theme().is_dark());
+    Button::new(id)
+        .custom(ButtonCustomVariant::new(cx).color(transparent_black()).foreground(p.ink_2).hover(p.ground_2).active(p.ground_2))
+        .rounded(px(8.))
+        .icon(glyph)
+        .tooltip(name)
+        .bg(transparent_black())
+        .size(px(30.))
+}
+
 fn field(input: &Entity<InputState>, p: Palette) -> Div {
-    div().h(px(52.)).px(px(6.)).flex().items_center().rounded(px(16.)).bg(p.ground_2).child(Input::new(input).appearance(false))
+    div().h(px(40.)).px(px(4.)).flex().items_center().rounded(px(12.)).bg(p.ground_2).child(Input::new(input).appearance(false))
 }
 
 /// The logo mark, "the route": a line that changes course and arrives at a
@@ -1214,49 +1364,85 @@ fn wordmark(p: Palette, size: f32) -> Div {
         .child("proxy")
 }
 
-/// 15px label grey: labels, hints, statuses.
+/// The small label grey: labels, hints, statuses.
 fn label(text: impl Into<SharedString>, p: Palette) -> Div {
-    div().text_size(px(15.)).text_color(p.ink_2).child(text.into())
+    div().text_size(px(SMALL)).text_color(p.ink_2).child(text.into())
 }
 
-/// Display size, for the one loud word of a screen: 56px, stepping down for a
-/// longer word (Russian ones run wide) so it never breaks in the middle.
-// ponytail: sized by letter count for the 372px column of the minimum window
-// width, not by measuring the text. Measure it if a language outgrows this.
-fn figure(text: &'static str) -> Div {
-    let size = (372. / (text.chars().count() as f32 * 0.7)).clamp(40., 56.);
-    div().text_size(px(size)).line_height(relative(0.98)).font_weight(FontWeight::EXTRA_BOLD).child(text)
+/// 17px semibold: the line under the loud word, and what a screen is waiting for.
+fn heading(text: impl Into<SharedString>) -> Div {
+    div().text_size(px(17.)).line_height(relative(1.3)).font_weight(FontWeight::SEMIBOLD).child(text.into())
 }
 
-/// A section: 52px above, a 17px semibold title, an optional grey figure beside it.
-fn block(title: &'static str, aside: impl Into<SharedString>, p: Palette) -> Div {
-    v_flex().mt(px(52.)).child(
-        h_flex().justify_between().mb(px(14.)).child(div().font_weight(FontWeight::SEMIBOLD).child(title)).child(label(aside, p)),
-    )
+/// Display size, for the one loud word of a screen: 40px, stepping down for a
+/// longer word so it never breaks in the middle.
+// ponytail: sized by letter count for the 380px column of the window, not by
+// measuring the text. Measure it if a language outgrows this.
+fn figure(text: &'static str, color: Hsla) -> Div {
+    let size = (380. / (text.chars().count() as f32 * 0.7)).clamp(28., 40.);
+    div().text_size(px(size)).line_height(relative(1.)).font_weight(FontWeight::EXTRA_BOLD).text_color(color).child(text)
+}
+
+/// A group of rows under a small grey title, with an optional figure beside it.
+fn group(title: &'static str, aside: impl Into<SharedString>, p: Palette) -> Div {
+    v_flex().mt(px(18.)).child(h_flex().justify_between().mb(px(2.)).child(label(title, p).font_weight(FontWeight::SEMIBOLD)).child(label(aside, p)))
+}
+
+/// One setting: an icon, its name over an optional grey line and, added by
+/// the caller, its control on the right.
+fn setting(glyph: IconName, title: impl Into<SharedString>, sub: impl Into<SharedString>, p: Palette) -> Div {
+    let sub = sub.into();
+    h_flex()
+        .items_center()
+        .gap(px(12.))
+        .py(px(7.))
+        .child(icon(glyph, 18., p.ink_2))
+        .child(v_flex().flex_1().overflow_hidden().child(div().font_weight(FontWeight::MEDIUM).child(title.into())).children((!sub.is_empty()).then(|| label(sub, p))))
+}
+
+/// A setting whose fields open under its row, in line with its name.
+fn under(row: Div, panel: Option<Div>) -> Div {
+    v_flex().child(row).children(panel.map(|panel| panel.pl(px(30.)).pt(px(2.)).pb(px(10.))))
+}
+
+/// A strip across the top of the window in a tone's tint: an icon, a line of
+/// text and, added by the caller, its one button.
+fn ribbon(tone: Tone, glyph: IconName, text: impl Into<SharedString>, p: Palette) -> Div {
+    let color = p.tone(tone);
+    h_flex()
+        .items_center()
+        .gap(px(10.))
+        .px(px(20.))
+        .py(px(8.))
+        .bg(color.opacity(0.14))
+        .text_size(px(SMALL))
+        .child(icon(glyph, 16., color))
+        // overflow_hidden: lets the text shrink and wrap instead of pushing the button out.
+        .child(div().flex_1().overflow_hidden().child(text.into()))
 }
 
 /// The last minute of the connection: two speeds with their totals, and a graph
-/// of both. Download is full ink and upload a lighter step of the same ink
-/// (DESIGN.md, "The Ink Strength Rule": categories never get a second hue).
+/// of both. Download is full ink and upload a lighter step of the same ink:
+/// categories never get a second hue.
 fn traffic_figure(traffic: &Traffic, p: Palette, s: &'static Strings) -> Div {
     let (up, down) = traffic.rates.back().copied().unwrap_or_default();
     let upload_ink = p.ink.opacity(0.48);
     let series = |name: &'static str, ink: Hsla, rate: u64, total: u64| {
         v_flex()
             .flex_1()
-            .child(h_flex().items_center().gap(px(8.)).child(div().size(px(10.)).rounded(px(2.)).bg(ink)).child(label(name, p)))
-            .child(div().text_size(px(20.)).line_height(relative(1.3)).font_weight(FontWeight::SEMIBOLD).child(fill(s.per_second, &bytes(rate, s))))
+            .child(h_flex().items_center().gap(px(6.)).child(div().size(px(8.)).rounded(px(2.)).bg(ink)).child(label(name, p)))
+            .child(heading(fill(s.per_second, &bytes(rate, s))))
             .child(label(fill(s.in_total, &bytes(total, s)), p))
     };
     let points: Vec<(usize, f64, f64)> = traffic.rates.iter().enumerate().map(|(i, &(up, down))| (i, up as f64, down as f64)).collect();
     // A floor on the scale, so an idle link is a flat line and not amplified noise.
     let peak = traffic.rates.iter().map(|&(up, down)| up.max(down)).max().unwrap_or(0).max(10_000) as f64;
     v_flex()
-        .mt(px(28.))
-        .gap(px(14.))
-        .child(h_flex().gap(px(24.)).child(series(s.download, p.ink, down, traffic.received)).child(series(s.upload, upload_ink, up, traffic.sent)))
+        .mt(px(16.))
+        .gap(px(8.))
+        .child(h_flex().gap(px(20.)).child(series(s.download, p.ink, down, traffic.received)).child(series(s.upload, upload_ink, up, traffic.sent)))
         .child(
-            div().h(px(72.)).w_full().child(
+            div().h(px(56.)).w_full().child(
                 AreaChart::new(points)
                     .id("traffic")
                     .x(|point| point.0.to_string())
@@ -1278,11 +1464,6 @@ fn traffic_figure(traffic: &Traffic, p: Palette, s: &'static Strings) -> Div {
         .child(h_flex().justify_between().child(label(s.last_minute, p)).child(label(fill(s.peak, &fill(s.per_second, &bytes(peak as u64, s))), p)))
 }
 
-/// A grey label over a heavier value.
-fn pair(name: &'static str, value: String, p: Palette) -> Div {
-    v_flex().child(label(name, p)).child(div().text_size(px(20.)).line_height(relative(1.3)).font_weight(FontWeight::SEMIBOLD).child(value))
-}
-
 actions!(bkn_proxy, [Quit]);
 
 /// Brings the app to the front. On macOS it also returns it to the Dock and
@@ -1294,10 +1475,8 @@ fn foreground(cx: &mut App) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if let [_, mode, port, token_file] = args.as_slice()
-        && mode == "helper"
-    {
-        if let Err(error) = tunnel::helper_main(port, token_file) {
+    if args.get(1).is_some_and(|mode| mode == "helper") {
+        if let Err(error) = tunnel::helper_main(&args[2..]) {
             eprintln!("{error:#}");
             std::process::exit(1);
         }
@@ -1317,7 +1496,7 @@ fn main() {
     let saved_token = keychain().and_then(|k| k.get_password().ok());
     tracing::info!(saved_session = saved_token.is_some(), "keychain read");
     let lang = Lang::load();
-    let application = gpui_kit::application();
+    let application = gpui_kit::application().with_assets(Icons);
     // macOS: opening the app again while it runs in the background brings the window back.
     application.on_reopen(foreground);
     application.run(move |cx| {
@@ -1406,7 +1585,29 @@ mod tests {
             });
             window.render_frame(cx);
             assert!(window.try_find("install-settings").is_some() && window.try_find("check-updates").is_none());
-            shell.update(cx, |shell, _| shell.update = None);
+            // The update ribbon is on top of every screen, the sign-in one included.
+            assert!(window.try_find("install").is_some());
+            shell.update(cx, |shell, cx| {
+                shell.screen = Screen::Login;
+                cx.notify();
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("login").is_some() && window.try_find("install").is_some());
+            shell.update(cx, |shell, cx| {
+                shell.screen = Screen::Settings;
+                shell.update = None;
+                cx.notify();
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("install").is_none());
+
+            // The password fields open under their row and close again.
+            assert!(window.try_find("password-save").is_none());
+            window.click("password", cx);
+            assert!(window.try_find("password-save").is_some());
+            window.click("password", cx);
+            assert!(window.try_find("password-save").is_none());
+
             window.click("back", cx);
             assert!(window.try_find("settings").is_some());
 
@@ -1444,7 +1645,8 @@ mod tests {
         assert_eq!((clock(5), clock(75), clock(3_675)), ("0:05".into(), "1:15".into(), "1:01:15".into()));
     }
 
-    /// Renders every screen offscreen, light and dark, into $BKN_SHOTS as PNGs.
+    /// Renders every screen offscreen, light and dark, into $BKN_SHOTS as PNGs,
+    /// at the size of the window below its title bar.
     /// Skipped when the variable is unset:
     ///   BKN_SHOTS=/tmp/shots cargo test -p bkn-proxy shots
     #[cfg(target_os = "macos")]
@@ -1455,12 +1657,12 @@ mod tests {
         let mut cx = HeadlessAppContext::with_platform(
             // Not `current_platform()`: on macOS that insists on the main thread.
             std::sync::Arc::new(gpui_apple::AppleTextSystem::new()),
-            std::sync::Arc::new(gpui_kit::assets::Assets),
+            std::sync::Arc::new(super::Icons),
             gpui_kit::platform::current_headless_renderer,
         );
         cx.update(gpui_kit::init);
         let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds { origin: Default::default(), size: size(px(420.), px(980.)) })),
+            window_bounds: Some(WindowBounds::Windowed(Bounds { origin: Default::default(), size: size(px(420.), px(612.)) })),
             focus: false,
             show: false,
             ..Default::default()
@@ -1521,7 +1723,15 @@ mod tests {
                 shell.traffic = Some(traffic);
             });
             shot("5-settings", &|shell| shell.screen = Screen::Settings);
+            shot("9-settings-open", &|shell| {
+                shell.open = Some(super::Panel::Password);
+                shell.info = lang.strings().copied.into();
+                shell.totp_setup = Some(crate::wire::TotpSetup { secret: "JBSWY3DPEHPK3PXP".into(), otpauth_url: "otpauth://totp/bkn-proxy".into() });
+            });
             shot("7-leftovers", &|shell| {
+                shell.open = None;
+                shell.info = "".into();
+                shell.totp_setup = None;
                 shell.screen = Screen::Proxies;
                 shell.leftovers = true;
                 shell.renaming = None;

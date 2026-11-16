@@ -81,15 +81,39 @@ async fn answer(mut stream: TcpStream, state: &str, s: &Strings) -> Option<Strin
     let query = |key: &str| url.query_pairs().find(|(k, _)| k == key).map(|(_, v)| v.into_owned());
     let found = url.path() == "/" && query("state").as_deref() == Some(state);
     let code = query("code").filter(|_| found);
-    let (status, text) = if code.is_some() { ("200 OK", s.signed_in_browser) } else { ("404 Not Found", "") };
-    let page = format!(
-        "<!doctype html><meta charset=utf-8><title>bkn-proxy</title>\
-         <body style=\"font:20px/1.4 system-ui;margin:20vh auto;max-width:28em;padding:0 24px;background:#e8e8e6;color:#191918\">\
-         <p><b>bkn-proxy</b></p><p>{text}</p></body>"
-    );
+    // Anything but the callback itself gets a bare 404: nobody looks at it.
+    let (status, page) = if code.is_some() { ("200 OK", page(s)) } else { ("404 Not Found", String::new()) };
     let response = format!("HTTP/1.1 {status}\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{page}", page.len());
     let _ = stream.write_all(response.as_bytes()).await;
     code
+}
+
+/// What the browser tab shows once the app has its code: the app's own look
+/// (main.rs, "design"), light or dark with the system. The colours and the
+/// logo's geometry are those of `palette` and `mark_svg`; the page stands
+/// alone, so the wordmark's typeface travels inside it.
+fn page(s: &Strings) -> String {
+    format!(
+        concat!(
+            r#"<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>bkn-proxy</title><style>"#,
+            r#"@font-face{{font-family:"JetBrains Mono";font-weight:500;src:url(data:font/ttf;base64,{font})}}"#,
+            ":root{{color-scheme:light dark;--ground:#e8e8e6;--ink:#191918;--ink-2:#5c5c59;--signal:#b53604;--success:#17633a}}",
+            "@media(prefers-color-scheme:dark){{:root{{--ground:#1e1e1d;--ink:#f1f1ee;--ink-2:#a2a29d;--signal:#ff6a2b;--success:#5fd08a}}}}",
+            r#"body{{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--ground);color:var(--ink);font:15px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}}"#,
+            "main{{width:min(380px,100vw - 40px);padding-bottom:10vh}}",
+            ".brand{{display:flex;align-items:center;gap:12px;margin-bottom:18px}}",
+            r#".brand span{{font:500 24px/1.2 "JetBrains Mono",ui-monospace,monospace}}.brand i{{font-style:normal;color:var(--signal)}}"#,
+            "h1{{display:flex;align-items:center;gap:8px;margin:0 0 4px;font-size:17px;line-height:1.3;color:var(--success)}}",
+            "p{{margin:0;font-size:13px;color:var(--ink-2)}}</style>",
+            r#"<main><div class=brand><svg width=56 height=56 viewBox="0 0 64 64" aria-hidden=true><path d="M4 20 H24 L40 44 H45" fill=none stroke=currentColor stroke-width=9 stroke-linejoin=round /><circle cx=55 cy=44 r=6.5 fill="var(--signal)"/></svg><span>bkn<i>-</i>proxy</span></div>"#,
+            // Lucide's circle-check, as in the app.
+            r#"<h1><svg width=18 height=18 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2 stroke-linecap=round stroke-linejoin=round aria-hidden=true><circle cx=12 cy=12 r=10 /><path d="m16 9-5.5 5.5L8 12"/></svg>{title}</h1>"#,
+            "<p>{hint}</p></main>"
+        ),
+        font = base64::engine::general_purpose::STANDARD.encode(crate::FONT),
+        title = s.signed_in_browser,
+        hint = s.signed_in_browser_hint,
+    )
 }
 
 /// For tests: the parts of the callback the app checks.
@@ -124,6 +148,19 @@ mod tests {
         assert_eq!(callback_for_test("/?code=abc&state=other", "s3cret-state").await, None, "wrong state");
         assert_eq!(callback_for_test("/favicon.ico", "s3cret-state").await, None);
         assert_eq!(callback_for_test("/evil?code=abc&state=s3cret-state", "s3cret-state").await, None, "wrong path");
+    }
+
+    /// The page is whole, and `BKN_SHOTS=dir cargo test` leaves it there to look at.
+    #[test]
+    fn signed_in_page() {
+        for lang in crate::i18n::Lang::ALL {
+            let page = page(lang.strings());
+            assert!(page.contains(lang.strings().signed_in_browser) && page.ends_with("</main>"));
+            if let Ok(dir) = std::env::var("BKN_SHOTS") {
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(format!("{dir}/signed-in-{}.html", lang.code()), page).unwrap();
+            }
+        }
     }
 
     #[test]

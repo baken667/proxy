@@ -1,10 +1,19 @@
 //! Device-wide tunnel: a TUN interface + default routes, with every packet
 //! forwarded to the SOCKS5 proxy by tun2proxy.
 //!
-//! Creating a TUN device needs root/admin, so this same binary is re-launched
-//! elevated as `bkn-proxy helper <port> <token-file>` on the first connect
-//! (one OS password prompt). The helper stays up and connects back to the app
-//! over loopback, so switching proxies afterwards is instant and prompt-free.
+//! Creating a TUN device needs root/admin, so this same binary also runs as
+//! an elevated helper. How it gets there depends on the system:
+//!
+//! - macOS: the first connect installs the helper as a launchd service (one
+//!   password prompt, see `daemon`). After that launchd starts it whenever
+//!   the app opens the service's socket, with no prompt, until an update
+//!   changes the helper itself.
+//! - Windows and Linux: the first connect of every launch re-runs the binary
+//!   elevated as `bkn-proxy helper <port> <token-file>` (UAC or pkexec), and
+//!   the helper connects back to the app over loopback.
+//!
+//! Either way the helper stays up while the app does, so switching proxies is
+//! instant.
 //!
 //!   app -> helper:  `connect <socks5 url>` | `disconnect` | `repair`
 //!   helper -> app:  `up` | `down [reason]` | `repaired`
@@ -19,17 +28,18 @@
 //! The helper exits when that connection closes (app quit or crashed), which
 //! tears the tunnel down. How the routes and DNS are set, and why the system
 //! undoes them by itself even if the helper dies: see net.rs.
+#[cfg(not(target_os = "macos"))]
+use std::{net::Ipv4Addr, path::Path};
 use std::{
-    net::Ipv4Addr,
-    path::Path,
     sync::atomic::{AtomicU64, Ordering::Relaxed},
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
+#[cfg(not(target_os = "macos"))]
+use tokio::net::{TcpListener, TcpStream};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream},
     process::Command,
     sync::mpsc,
     task::JoinHandle,
@@ -50,12 +60,34 @@ unsafe extern "C" fn on_traffic(status: *const tun2proxy::TrafficStatus, _: *mut
     }
 }
 
-pub fn helper_main(port: &str, token_file: &str) -> Result<()> {
+/// What the helper is built from (build.rs). The app reinstalls the macOS
+/// service when the installed one answers with another value.
+#[cfg(target_os = "macos")]
+const BUILD: &str = env!("BKN_HELPER_BUILD");
+
+pub fn helper_main(args: &[String]) -> Result<()> {
     tokio::runtime::Runtime::new()?.block_on(async {
-        let token = std::fs::read_to_string(token_file).context("read token file")?;
-        let stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port.parse::<u16>()?)).await?;
-        let (read, mut write) = stream.into_split();
-        write.write_all(format!("{}\n", token.trim()).as_bytes()).await?;
+        // macOS: launchd accepted the app's connection and handed it to us as
+        // stdin (see `daemon`). First of all, say which build this is.
+        #[cfg(target_os = "macos")]
+        let (read, mut write) = {
+            let _ = args;
+            // SAFETY: fd 0 is ours alone; nothing else in the helper reads stdin.
+            let stream = unsafe { <std::os::unix::net::UnixStream as std::os::fd::FromRawFd>::from_raw_fd(0) };
+            stream.set_nonblocking(true)?;
+            let (read, mut write) = tokio::net::UnixStream::from_std(stream).context("the helper is started by launchd, not by hand")?.into_split();
+            write.write_all(format!("hello {BUILD}\n").as_bytes()).await?;
+            (read, write)
+        };
+        #[cfg(not(target_os = "macos"))]
+        let (read, mut write) = {
+            let [port, token_file] = args else { bail!("usage: bkn-proxy helper <port> <token-file>") };
+            let token = std::fs::read_to_string(token_file).context("read token file")?;
+            let stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port.parse::<u16>()?)).await?;
+            let (read, mut write) = stream.into_split();
+            write.write_all(format!("{}\n", token.trim()).as_bytes()).await?;
+            (read, write)
+        };
 
         let mut commands = BufReader::new(read).lines();
         let (states, mut state_rx) = mpsc::unbounded_channel::<String>();
@@ -245,39 +277,21 @@ impl Tunnel {
         let _ = self.commands.send("disconnect".into());
     }
 
-    /// Starts the elevated helper and waits for it to connect back. Every
-    /// state line it reports afterwards is forwarded to `states`.
-    pub async fn launch(states: mpsc::UnboundedSender<String>) -> Result<Tunnel> {
-        tracing::info!("starting the tunnel helper (asks for administrator access)");
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-        let port = listener.local_addr()?.port();
-        // Other local users can see the port but not this file, so only our
-        // helper can authenticate. (Processes of the same user could; they
-        // can already do everything this app can.)
-        let token = format!("{:032x}{:032x}", rand::random::<u128>(), rand::random::<u128>());
-        let token_file = std::env::temp_dir().join(format!("bkn-proxy-{:016x}.token", rand::random::<u64>()));
-        write_private(&token_file, &token)?;
-
-        let accepted: Result<BufReader<TcpStream>> = async {
-            let mut child = elevate(port, &token_file)?.spawn().context("start elevation prompt")?;
-            let accept = tokio::time::timeout(Duration::from_secs(120), accept_helper(&listener, &token));
-            tokio::pin!(accept);
-            let stream = tokio::select! {
-                stream = &mut accept => stream,
-                // macOS/Windows: the launcher exits as soon as the prompt is
-                // answered. Linux: pkexec stays for the helper's lifetime.
-                status = child.wait() => {
-                    if !status?.success() {
-                        bail!("elevation_denied"); // a code: see Strings::message
-                    }
-                    accept.await
-                }
-            };
-            stream.context("helper_not_started")?
-        }
-        .await;
-        let _ = std::fs::remove_file(&token_file);
-        let (read, mut write) = accepted.inspect_err(|error| tracing::error!("tunnel helper did not start: {error:#}"))?.into_inner().into_split();
+    /// Starts the elevated helper and waits until the app is connected to
+    /// it. Every state line it reports afterwards is forwarded to `states`.
+    /// `prompt` is what the system's password dialog says, when there is one.
+    pub async fn launch(states: mpsc::UnboundedSender<String>, prompt: &str) -> Result<Tunnel> {
+        #[cfg(target_os = "macos")]
+        let connected = daemon::connect(prompt).await;
+        #[cfg(not(target_os = "macos"))]
+        let connected = {
+            let _ = prompt; // UAC and pkexec word their own dialogs
+            elevated().await.map(|stream| {
+                let (read, write) = stream.into_inner().into_split();
+                (BufReader::new(read), write)
+            })
+        };
+        let (read, mut write) = connected.inspect_err(|error| tracing::error!("tunnel helper did not start: {error:#}"))?;
         tracing::info!("tunnel helper connected");
 
         let (commands, mut command_rx) = mpsc::unbounded_channel::<String>();
@@ -289,7 +303,7 @@ impl Tunnel {
             }
         });
         tokio::spawn(async move {
-            let mut lines = BufReader::new(read).lines();
+            let mut lines = read.lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 if let Some(message) = line.strip_prefix("log ") {
                     tracing::warn!("tunnel helper: {message}");
@@ -304,7 +318,44 @@ impl Tunnel {
     }
 }
 
+/// Windows and Linux: asks for administrator rights, runs the helper and
+/// waits for it to connect back.
+#[cfg(not(target_os = "macos"))]
+async fn elevated() -> Result<BufReader<TcpStream>> {
+    tracing::info!("starting the tunnel helper (asks for administrator access)");
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let port = listener.local_addr()?.port();
+    // Other local users can see the port but not this file, so only our
+    // helper can authenticate. (Processes of the same user could; they
+    // can already do everything this app can.)
+    let token = format!("{:032x}{:032x}", rand::random::<u128>(), rand::random::<u128>());
+    let token_file = std::env::temp_dir().join(format!("bkn-proxy-{:016x}.token", rand::random::<u64>()));
+    write_private(&token_file, &token)?;
+
+    let accepted: Result<BufReader<TcpStream>> = async {
+        let mut child = elevate(port, &token_file)?.spawn().context("start elevation prompt")?;
+        let accept = tokio::time::timeout(Duration::from_secs(120), accept_helper(&listener, &token));
+        tokio::pin!(accept);
+        let stream = tokio::select! {
+            stream = &mut accept => stream,
+            // Windows: the launcher exits as soon as the prompt is answered.
+            // Linux: pkexec stays for the helper's lifetime.
+            status = child.wait() => {
+                if !status?.success() {
+                    bail!("elevation_denied"); // a code: see Strings::message
+                }
+                accept.await
+            }
+        };
+        stream.context("helper_not_started")?
+    }
+    .await;
+    let _ = std::fs::remove_file(&token_file);
+    accepted
+}
+
 /// First connection whose first line is our token wins.
+#[cfg(not(target_os = "macos"))]
 async fn accept_helper(listener: &TcpListener, token: &str) -> Result<BufReader<TcpStream>> {
     loop {
         let (stream, _) = listener.accept().await?;
@@ -316,6 +367,7 @@ async fn accept_helper(listener: &TcpListener, token: &str) -> Result<BufReader<
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn write_private(path: &Path, content: &str) -> Result<()> {
     use std::io::Write;
     let mut options = std::fs::OpenOptions::new();
@@ -327,24 +379,11 @@ fn write_private(path: &Path, content: &str) -> Result<()> {
 }
 
 /// The command that re-runs this binary as `helper` with admin rights.
+#[cfg(not(target_os = "macos"))]
 fn elevate(port: u16, token_file: &Path) -> Result<Command> {
     let exe = std::env::current_exe()?;
     let exe = exe.to_str().context("non-UTF-8 executable path")?;
     let file = token_file.to_str().context("non-UTF-8 temp path")?;
-
-    #[cfg(target_os = "macos")]
-    let command = {
-        let sh_quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
-        // `do shell script` runs /bin/sh as root; `&` detaches the helper so osascript returns.
-        let sh = format!("{} helper {port} {} >/dev/null 2>&1 &", sh_quote(exe), sh_quote(file));
-        let script = format!(
-            "do shell script \"{}\" with prompt \"bkn-proxy needs administrator access to route this device's traffic.\" with administrator privileges",
-            sh.replace('\\', "\\\\").replace('"', "\\\"")
-        );
-        let mut c = Command::new("osascript");
-        c.args(["-e", &script]);
-        c
-    };
 
     #[cfg(target_os = "linux")]
     let command = {
@@ -366,4 +405,153 @@ fn elevate(port: u16, token_file: &Path) -> Result<Command> {
     };
 
     Ok(command)
+}
+
+// ------------------------------------------------------- macOS: the service
+
+/// The helper as a launchd service. Installing it takes one password prompt.
+/// From then on launchd listens on a socket and, for every connection the app
+/// opens, runs one helper as root with that connection as its stdin. The
+/// helper exits when the app closes the connection, as it always did.
+///
+/// Who may connect: only the user who installed it (the socket is theirs,
+/// mode 0600). Any program of that user can therefore route the device
+/// through a proxy of its choice without a prompt; that is the price of not
+/// being asked every time, and what the line protocol lets them do ends
+/// there. What runs as root is a copy of this binary that only root can
+/// replace.
+#[cfg(target_os = "macos")]
+mod daemon {
+    use tokio::net::{
+        UnixStream,
+        unix::{OwnedReadHalf, OwnedWriteHalf},
+    };
+
+    use super::*;
+
+    /// A debug build gets a service of its own: `cargo run` must never replace
+    /// the installed app's helper, which may be carrying a tunnel.
+    const LABEL: &str = if cfg!(debug_assertions) { "kz.bkn.proxy.helper.dev" } else { "kz.bkn.proxy.helper" };
+
+    fn socket() -> String {
+        format!("/var/run/{LABEL}.sock")
+    }
+
+    type Link = (BufReader<OwnedReadHalf>, OwnedWriteHalf);
+
+    /// Connects to the installed helper; installs it first if it is missing
+    /// or built from other sources than this app.
+    pub async fn connect(prompt: &str) -> Result<Link> {
+        match hello().await {
+            Ok(link) => Ok(link),
+            Err(error) => {
+                tracing::info!("installing the tunnel helper (asks for administrator access): {error:#}");
+                install(prompt).await?;
+                hello().await.context("helper_not_started") // a code: see Strings::message
+            }
+        }
+    }
+
+    async fn hello() -> Result<Link> {
+        let (read, write) = UnixStream::connect(socket()).await?.into_split();
+        let mut read = BufReader::new(read);
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(15), read.read_line(&mut line)).await.context("the helper did not answer")??;
+        if line.trim_end() != format!("hello {BUILD}") {
+            bail!("the installed helper is another build"); // dropping the connection ends it
+        }
+        Ok((read, write))
+    }
+
+    unsafe extern "C" {
+        safe fn getuid() -> u32;
+    }
+
+    async fn install(prompt: &str) -> Result<()> {
+        let exe = std::env::current_exe()?;
+        let script = install_script(exe.to_str().context("non-UTF-8 executable path")?, getuid());
+        let quoted = |text: &str| text.replace('\\', "\\\\").replace('"', "\\\"");
+        let script = format!("do shell script \"{}\" with prompt \"{}\" with administrator privileges", quoted(&script), quoted(prompt));
+        let out = Command::new("osascript").args(["-e", &script]).output().await.context("start elevation prompt")?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let why = String::from_utf8_lossy(&out.stderr);
+        if why.contains("-128") {
+            bail!("elevation_denied"); // Cancel in the password dialog
+        }
+        Err(anyhow::anyhow!("{}", why.trim())).context("helper_not_started")
+    }
+
+    /// What runs as root, once: one line of /bin/sh.
+    fn install_script(exe: &str, uid: u32) -> String {
+        let quote = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
+        let (bin, plist_file) = (format!("/Library/PrivilegedHelperTools/{LABEL}"), format!("/Library/LaunchDaemons/{LABEL}.plist"));
+        [
+            "set -e".to_string(),
+            "mkdir -p /Library/PrivilegedHelperTools".into(),
+            // Copied aside and renamed into place: a helper that is running
+            // keeps its own file, and the new one is never half-written.
+            // -X: without the download quarantine mark of the app.
+            format!("cp -X {} {bin}.new", quote(exe)),
+            format!("chown root:wheel {bin}.new"),
+            format!("chmod 755 {bin}.new"),
+            format!("mv -f {bin}.new {bin}"),
+            format!("printf %s {} > {plist_file}", quote(&plist(uid))),
+            format!("chown root:wheel {plist_file}"),
+            format!("chmod 644 {plist_file}"),
+            format!("launchctl bootout system/{LABEL} 2>/dev/null || true"),
+            // bootout returns before launchd has let go of the old service.
+            format!("n=0; until launchctl bootstrap system {plist_file}; do n=$((n+1)); [ $n -lt 10 ] || exit 1; sleep 0.5; done"),
+        ]
+        .join("; ")
+    }
+
+    /// The service: launchd owns the socket, accepts on it and starts one
+    /// helper per connection (`inetdCompatibility`, the way macOS runs sshd).
+    /// 384 is mode 0600; a property list has no octal.
+    fn plist(uid: u32) -> String {
+        format!(
+            concat!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>"#,
+                r#"<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">"#,
+                r#"<plist version="1.0"><dict>"#,
+                "<key>Label</key><string>{label}</string>",
+                "<key>ProgramArguments</key><array><string>/Library/PrivilegedHelperTools/{label}</string><string>helper</string></array>",
+                "<key>Sockets</key><dict><key>Listeners</key><dict>",
+                "<key>SockPathName</key><string>{socket}</string>",
+                "<key>SockPathMode</key><integer>384</integer>",
+                "<key>SockPathOwner</key><integer>{uid}</integer>",
+                "</dict></dict>",
+                "<key>inetdCompatibility</key><dict><key>Wait</key><false/></dict>",
+                // The helper's stderr must not end up in the connection.
+                "<key>StandardErrorPath</key><string>/dev/null</string>",
+                "</dict></plist>"
+            ),
+            label = LABEL,
+            socket = socket(),
+            uid = uid
+        )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The two things root is handed are well-formed: launchd's own tool
+        /// reads the property list, and sh parses the script without running it.
+        #[test]
+        fn service_files_are_well_formed() {
+            let file = std::env::temp_dir().join(format!("bkn-proxy-test-{}.plist", std::process::id()));
+            std::fs::write(&file, plist(501)).unwrap();
+            let lint = std::process::Command::new("plutil").arg("-lint").arg(&file).output().unwrap();
+            let _ = std::fs::remove_file(&file);
+            assert!(lint.status.success(), "{}", String::from_utf8_lossy(&lint.stdout));
+
+            let script = install_script("/Applications/it's here/bkn-proxy", 501);
+            assert!(!script.contains('\n'), "an AppleScript string is one line");
+            let parsed = std::process::Command::new("sh").args(["-n", "-c", &script]).output().unwrap();
+            assert!(parsed.status.success(), "{}", String::from_utf8_lossy(&parsed.stderr));
+        }
+    }
 }

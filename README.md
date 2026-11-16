@@ -27,9 +27,9 @@ Built with Rust, [GPUI](https://www.gpui.rs) and
   uses and how many bytes went through: no addresses, no DNS names. The
   server's backoffice shows who is online and the traffic.
 - English and Russian, light and dark; a fixed-size window.
-- Checks for a newer version every six hours and from a button in Settings,
-  downloads and verifies it, says so in a system notification and offers to
-  install.
+- Checks for a newer version every hour and from a button in Settings,
+  downloads and verifies it, then says so in a system notification and in a
+  ribbon across the top of every screen, with an Install button.
 
 ## Run from source
 
@@ -49,20 +49,38 @@ cargo test
 ```
 
 To look at every screen without launching the app, render them offscreen to
-PNG (macOS):
+PNG (macOS). The page the browser shows after sign-in is written next to them
+as HTML:
 
 ```bash
-BKN_SHOTS=/tmp/bkn-shots cargo test shots
+BKN_SHOTS=/tmp/bkn-shots cargo test
 ```
 
 ## How the tunnel works
 
-The first Connect re-launches the app's own binary with administrator rights
-as a helper (one password prompt: `osascript` on macOS, UAC on Windows,
-`pkexec` on Linux). The helper creates a tun device and forwards everything
-in it to the chosen proxy with tun2proxy; names are resolved by the proxy, so
-DNS does not leak. Switching proxies reuses the running helper, so it is
-instant. Quitting the app stops the helper.
+A helper with administrator rights, the app's own binary in another mode,
+creates a tun device and forwards everything in it to the chosen proxy with
+tun2proxy; names are resolved by the proxy, so DNS does not leak. Switching
+proxies reuses the running helper, so it is instant. Quitting the app stops
+the helper.
+
+How the helper gets its rights:
+
+- macOS asks for the administrator password once. The first Connect copies
+  the binary to `/Library/PrivilegedHelperTools/kz.bkn.proxy.helper` and
+  registers it with launchd (`/Library/LaunchDaemons/kz.bkn.proxy.helper.plist`).
+  From then on launchd starts the helper whenever the app opens the service's
+  socket, and the helper exits when the app closes it. An update asks again
+  only when it changes the helper itself (`src/tunnel.rs`, `src/net.rs` or a
+  dependency). Only the user who installed the service can open its socket;
+  any program of that user can then switch the tunnel without a prompt.
+- Windows (UAC) and Linux (`pkexec`) ask at the first Connect of every launch.
+
+To remove the service from a Mac:
+
+```bash
+sudo launchctl bootout system/kz.bkn.proxy.helper; sudo rm /Library/LaunchDaemons/kz.bkn.proxy.helper.plist /Library/PrivilegedHelperTools/kz.bkn.proxy.helper
+```
 
 On macOS and Windows every network change undoes itself if the helper goes
 away, even if it is killed (see `src/net.rs`):
@@ -112,8 +130,14 @@ described in `scripts/release-manifest.sh`.
 
 Texts live in `src/i18n.rs`, one `Strings` value per language: a string
 missing from a language does not compile. The interface follows one small
-design system: a flat ground, ink, a label grey and a single signal colour;
-no cards, borders or shadows.
+design system (`src/main.rs`, "design"): a flat ground, ink and a label grey;
+no cards, borders or shadows. Four colours carry a meaning and always come
+with an icon or a word: danger (errors, and actions that take something
+away), warning, success and info. The orange of the logo is the brand's and
+says nothing.
+
+Icons are [Lucide](https://lucide.dev), which gpui-kit bundles; the ones the
+app uses are listed in `icon_assets!` in `src/main.rs`.
 
 The wordmark is set in JetBrains Mono (SIL Open Font License, see
 `assets/JetBrainsMono-LICENSE.txt`). `assets/make-icons.py` regenerates the
@@ -121,3 +145,16 @@ icon files from `assets/icon.svg`, `assets/make-tray-icons.py` the tray icons.
 
 Linux needs GTK and libayatana-appindicator for the tray icon (on Debian and
 Ubuntu: `libgtk-3-dev libayatana-appindicator3-dev`).
+
+## License
+
+bkn-proxy is free software under the GNU General Public License, version 3 or
+later: see `LICENSE`. That is not only a choice. tun2proxy, which carries the
+tunnel, builds on socks5-impl, which is GPL-3.0-or-later, so the app as it is
+distributed is under the GPL either way.
+
+It ships JetBrains Mono (SIL Open Font License 1.1) and Lucide icons (ISC
+License); the Windows archive adds `wintun.dll` from wintun.net under its own
+license.
+
+To report a security problem, see `SECURITY.md`.

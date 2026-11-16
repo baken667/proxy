@@ -102,7 +102,9 @@ async fn check(public_key: &[u8]) -> Result<Option<Update>> {
     Ok(Some(Update { version: manifest.version, installer }))
 }
 
-/// Looks for an update now and every six hours until one is ready.
+/// Looks for an update now and every hour until one is ready. A check is
+/// two small files, so an hour costs nothing and a release reaches a running
+/// app within one.
 pub async fn watch(found: UnboundedSender<Update>) {
     let Some(public_key) = public_key() else { return };
     loop {
@@ -115,7 +117,7 @@ pub async fn watch(found: UnboundedSender<Update>) {
             Ok(None) => tracing::debug!("no update"),
             Err(error) => tracing::warn!("update check failed: {error:#}"),
         }
-        tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
+        tokio::time::sleep(Duration::from_secs(3600)).await;
     }
 }
 

@@ -4,6 +4,15 @@ What changed in each release of the bkn-proxy desktop app. The section for a
 version becomes the notes of its GitHub release, where a line break inside a
 paragraph shows as one: keep each entry on a single line.
 
+## 0.3.0 — 2026-11-17
+
+- macOS asks for the administrator password once instead of at the first connect of every launch. The first connect installs the tunnel helper as a system service; after that it starts without a prompt, also after the app or the Mac restarts. An update asks again only when it changes the helper itself. Windows still asks once per launch.
+- A more compact interface. Settings fits on one screen: every setting is a row with an icon and its button, and the password and two-factor fields open under their row only when asked for. Icons are Lucide.
+- Colours with a meaning: red for errors and for what takes something away (Sign out, Disconnect, turning two-factor off), amber for warnings, green for Connected and for what went well, blue for news. Each comes with an icon or a word.
+- A downloaded update shows as a ribbon across the top of every screen, with an Install button. The app looks for a new version every hour instead of every six.
+- The page the browser shows after sign-in has the app's logo, typeface and colours, light and dark.
+- The app is licensed under the GPL, version 3 or later; SECURITY.md says how to report a vulnerability.
+
 ## 0.2.3 — 2026-11-17
 
 - macOS: closing the window takes the app out of the Dock and the Cmd+Tab list. It stays in the menu bar: Open bkn-proxy there, or opening the app again, brings the window and the Dock icon back.
