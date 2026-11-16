@@ -29,8 +29,9 @@
 //! tears the tunnel down. How the routes and DNS are set, and why the system
 //! undoes them by itself even if the helper dies: see net.rs.
 #[cfg(not(target_os = "macos"))]
-use std::{net::Ipv4Addr, path::Path};
+use std::net::Ipv4Addr;
 use std::{
+    path::Path,
     sync::atomic::{AtomicU64, Ordering::Relaxed},
     time::Duration,
 };
@@ -483,21 +484,47 @@ mod daemon {
         Err(anyhow::anyhow!("{}", why.trim())).context("helper_not_started")
     }
 
+    /// Where root's copy of the helper lives. A bare binary (`cargo run`) is
+    /// copied as it is. An installed app is copied whole, as `<this>.app`:
+    /// the signature of a signed app's executable is bound to the bundle
+    /// around it (its Info.plist), and macOS kills the executable at launch
+    /// when it is run without one. That is what 0.3.0 did, so its helper
+    /// never started.
+    fn home() -> String {
+        format!("/Library/PrivilegedHelperTools/{LABEL}")
+    }
+
+    /// The helper's program as launchd runs it, for the app at `exe`.
+    fn program(exe: &str) -> String {
+        let exe = Path::new(exe);
+        match crate::update::bundle_of(exe).and_then(|bundle| exe.strip_prefix(bundle).ok()) {
+            Some(inside) => format!("{}.app/{}", home(), inside.display()), // .../Contents/MacOS/bkn-proxy
+            None => home(),
+        }
+    }
+
     /// What runs as root, once: one line of /bin/sh.
     fn install_script(exe: &str, uid: u32) -> String {
         let quote = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
-        let (bin, plist_file) = (format!("/Library/PrivilegedHelperTools/{LABEL}"), format!("/Library/LaunchDaemons/{LABEL}.plist"));
+        let (home, plist_file) = (home(), format!("/Library/LaunchDaemons/{LABEL}.plist"));
+        let (source, copy) = match crate::update::bundle_of(Path::new(exe)) {
+            Some(bundle) => (bundle.display().to_string(), format!("{home}.app")),
+            None => (exe.to_string(), home.clone()),
+        };
         [
             "set -e".to_string(),
             "mkdir -p /Library/PrivilegedHelperTools".into(),
-            // Copied aside and renamed into place: a helper that is running
-            // keeps its own file, and the new one is never half-written.
+            // Copied aside, then moved into place: never a half-written helper.
             // -X: without the download quarantine mark of the app.
-            format!("cp -X {} {bin}.new", quote(exe)),
-            format!("chown root:wheel {bin}.new"),
-            format!("chmod 755 {bin}.new"),
-            format!("mv -f {bin}.new {bin}"),
-            format!("printf %s {} > {plist_file}", quote(&plist(uid))),
+            format!("rm -rf {copy}.new"),
+            format!("cp -RX {} {copy}.new", quote(&source)),
+            // Root's own, and nobody else's to change: this is what runs as root.
+            format!("chown -R root:wheel {copy}.new"),
+            format!("chmod -R go-w {copy}.new"),
+            // Both shapes of an earlier copy go; a helper that is running keeps its open files.
+            format!("rm -rf {home} {home}.app"),
+            format!("mv {copy}.new {copy}"),
+            format!("printf %s {} > {plist_file}", quote(&plist(uid, &program(exe)))),
             format!("chown root:wheel {plist_file}"),
             format!("chmod 644 {plist_file}"),
             format!("launchctl bootout system/{LABEL} 2>/dev/null || true"),
@@ -510,14 +537,14 @@ mod daemon {
     /// The service: launchd owns the socket, accepts on it and starts one
     /// helper per connection (`inetdCompatibility`, the way macOS runs sshd).
     /// 384 is mode 0600; a property list has no octal.
-    fn plist(uid: u32) -> String {
+    fn plist(uid: u32, program: &str) -> String {
         format!(
             concat!(
                 r#"<?xml version="1.0" encoding="UTF-8"?>"#,
                 r#"<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">"#,
                 r#"<plist version="1.0"><dict>"#,
                 "<key>Label</key><string>{label}</string>",
-                "<key>ProgramArguments</key><array><string>/Library/PrivilegedHelperTools/{label}</string><string>helper</string></array>",
+                "<key>ProgramArguments</key><array><string>{program}</string><string>helper</string></array>",
                 "<key>Sockets</key><dict><key>Listeners</key><dict>",
                 "<key>SockPathName</key><string>{socket}</string>",
                 "<key>SockPathMode</key><integer>384</integer>",
@@ -529,6 +556,7 @@ mod daemon {
                 "</dict></plist>"
             ),
             label = LABEL,
+            program = program,
             socket = socket(),
             uid = uid
         )
@@ -542,16 +570,25 @@ mod daemon {
         /// reads the property list, and sh parses the script without running it.
         #[test]
         fn service_files_are_well_formed() {
+            // An installed app is copied whole and run from inside the copy; a bare binary is copied alone.
+            let installed = "/Applications/it's here/bkn-proxy.app/Contents/MacOS/bkn-proxy";
+            assert_eq!(program(installed), format!("{}.app/Contents/MacOS/bkn-proxy", home()));
+            assert_eq!(program("/code/target/debug/bkn-proxy"), home());
+            assert!(install_script(installed, 501).contains("cp -RX '/Applications/it'\\''s here/bkn-proxy.app' "));
+            assert!(install_script("/code/target/debug/bkn-proxy", 501).contains("cp -RX '/code/target/debug/bkn-proxy' "));
+
             let file = std::env::temp_dir().join(format!("bkn-proxy-test-{}.plist", std::process::id()));
-            std::fs::write(&file, plist(501)).unwrap();
+            std::fs::write(&file, plist(501, &program(installed))).unwrap();
             let lint = std::process::Command::new("plutil").arg("-lint").arg(&file).output().unwrap();
             let _ = std::fs::remove_file(&file);
             assert!(lint.status.success(), "{}", String::from_utf8_lossy(&lint.stdout));
 
-            let script = install_script("/Applications/it's here/bkn-proxy", 501);
-            assert!(!script.contains('\n'), "an AppleScript string is one line");
-            let parsed = std::process::Command::new("sh").args(["-n", "-c", &script]).output().unwrap();
-            assert!(parsed.status.success(), "{}", String::from_utf8_lossy(&parsed.stderr));
+            for exe in [installed, "/code/target/debug/bkn-proxy"] {
+                let script = install_script(exe, 501);
+                assert!(!script.contains('\n'), "an AppleScript string is one line");
+                let parsed = std::process::Command::new("sh").args(["-n", "-c", &script]).output().unwrap();
+                assert!(parsed.status.success(), "{}", String::from_utf8_lossy(&parsed.stderr));
+            }
         }
     }
 }

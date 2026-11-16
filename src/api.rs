@@ -20,9 +20,20 @@ pub fn base() -> String {
 const API: &str = "/api/v1";
 
 /// A file from the server's /downloads (update manifest, installer).
-pub async fn download(name: &str) -> Result<Vec<u8>, reqwest::Error> {
-    let response = HTTP.get(format!("{}/downloads/{name}", base())).timeout(Duration::from_secs(600)).send().await?;
-    Ok(response.error_for_status()?.bytes().await?.to_vec())
+/// `progress` hears each new whole percent, when the server says how long the file is.
+pub async fn download(name: &str, mut progress: impl FnMut(u8)) -> Result<Vec<u8>, reqwest::Error> {
+    let mut response = HTTP.get(format!("{}/downloads/{name}", base())).timeout(Duration::from_secs(600)).send().await?.error_for_status()?;
+    let total = response.content_length().filter(|total| *total > 0);
+    let (mut bytes, mut said) = (Vec::new(), 0);
+    while let Some(chunk) = response.chunk().await? {
+        bytes.extend_from_slice(&chunk);
+        let percent = total.map_or(0, |total| (bytes.len() as u64 * 100 / total).min(100) as u8);
+        if percent != said {
+            said = percent;
+            progress(percent);
+        }
+    }
+    Ok(bytes)
 }
 
 /// The API's machine code ("totp_required", "unauthorized", ...) or "offline".

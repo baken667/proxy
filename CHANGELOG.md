@@ -4,6 +4,12 @@ What changed in each release of the bkn-proxy desktop app. The section for a
 version becomes the notes of its GitHub release, where a line break inside a
 paragraph shows as one: keep each entry on a single line.
 
+## 0.3.1 — 2026-11-17
+
+- Fixed: on macOS 0.3.0 could not connect at all. It asked for the administrator password and then said "The tunnel helper did not start": macOS refuses to run a signed app's executable outside its app, and that is how the helper was installed. The helper is now a copy of the whole app. The first connect after this update asks for the password once more.
+- Updates work the way they do in Zed. Check only asks whether there is a newer version and answers at once. Update downloads it with a visible progress and, on macOS, installs it in place without opening the disk image; Restart then runs the new version. Every step is said in the ribbon on top and in Settings, and system notifications carry the same buttons. Windows still gets the downloaded archive opened.
+- The sign-in page and the account page open in the app's language, not the browser's. They have a language switch of their own, as does the download site.
+
 ## 0.3.0 — 2026-11-17
 
 - macOS asks for the administrator password once instead of at the first connect of every launch. The first connect installs the tunnel helper as a system service; after that it starts without a prompt, also after the app or the Mac restarts. An update asks again only when it changes the helper itself. Windows still asks once per launch.

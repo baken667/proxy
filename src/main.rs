@@ -69,6 +69,22 @@ enum Screen {
     Settings,
 }
 
+/// Where the update stands. Every step is said on screen (`update_status`).
+enum Update {
+    /// Nothing to say: not checked yet, up to date, or the check failed.
+    None,
+    Checking,
+    /// The server offers a newer version; nothing is downloaded yet.
+    Available(update::Offer),
+    /// The user asked for it: percent of the installer received.
+    Downloading(update::Offer, u8),
+    Installing(update::Offer),
+    /// The new version is in the app's place; a restart runs it.
+    Installed(String),
+    /// It could not be put in place: the installer, for the user to open.
+    Downloaded(String, std::path::PathBuf),
+}
+
 /// A setting whose fields are open under its row.
 #[derive(Clone, Copy, PartialEq)]
 enum Panel {
@@ -114,11 +130,9 @@ struct Shell {
     /// The proxy whose name is being edited, and the field it is edited in.
     renaming: Option<i64>,
     rename: Entity<InputState>,
-    /// A newer version, already downloaded and verified.
-    update: Option<update::Update>,
-    /// The check started from Settings is running.
-    checking_update: bool,
-    /// What that check found, when it was not an update.
+    update: Update,
+    /// What the last check or install came to, when that was not an update:
+    /// "you have the latest version", or what failed.
     update_note: SharedString,
     /// The logo mark, drawn for the light and for the dark theme.
     marks: [Arc<Image>; 2],
@@ -159,32 +173,34 @@ impl Shell {
             cx.notify();
         }));
 
-        // A newer version arrives here once it is downloaded and verified.
-        let (found, mut updates) = mpsc::unbounded_channel();
+        // A newer version found in the background arrives here.
+        let (found, mut offers) = mpsc::unbounded_channel();
         RT.spawn(update::watch(found));
         cx.spawn(async move |this, cx| {
-            while let Some(update) = updates.recv().await {
+            while let Some(offer) = offers.recv().await {
                 let _ = this.update(cx, |this, cx| {
-                    // Found in the background: say so even when the window is closed.
+                    // The button in Settings may have found it first, or be past it.
+                    if !matches!(this.update, Update::None | Update::Checking) {
+                        return;
+                    }
+                    // Say so even when the window is closed.
                     let s = this.lang.strings();
-                    cx.show_system_notification(SystemNotification {
-                        tag: "update".into(),
-                        title: s.update_available.into(),
-                        body: fill(s.update_ready, &update.version).into(),
-                        actions: vec![SystemNotificationAction { id: "install".into(), label: s.install.into() }],
-                    });
-                    this.update = Some(update);
+                    this.notify_update(fill(s.version_available, &offer.version), "update", s.update_now, cx);
+                    this.update = Update::Available(offer);
+                    this.update_note = "".into();
                     cx.notify();
                 });
             }
         })
         .detach();
-        // A click on that notification brings the window back; its button opens the installer.
+        // A click on a notification brings the window back; its button does what it says.
         let (this, handle) = (cx.weak_entity(), window.window_handle());
         cx.on_system_notification_response(move |response, cx| {
             let _ = handle.update(cx, |_, window, cx| {
-                let _ = this.update(cx, |this, cx| match response.action_id {
-                    Some(_) => this.install(),
+                let _ = this.update(cx, |this, cx| match response.action_id.as_deref() {
+                    Some("update") => this.start_update(cx),
+                    Some("restart") => cx.restart(),
+                    Some(_) => this.open_installer(),
                     None => this.tray_action(tray::Action::Open, window, cx),
                 });
             });
@@ -291,8 +307,7 @@ impl Shell {
             refresh: None,
             renaming: None,
             rename,
-            update: None,
-            checking_update: false,
+            update: Update::None,
             update_note: "".into(),
             marks: [false, true].map(|dark| Arc::new(Image::from_bytes(ImageFormat::Svg, mark_svg(palette(dark))))),
             current_password,
@@ -381,7 +396,7 @@ impl Shell {
     fn sign_in(&mut self, cx: &mut Context<Self>) {
         self.note = "".into();
         let strings = self.lang.strings();
-        let task = RT.spawn(signin::sign_in(strings));
+        let task = RT.spawn(signin::sign_in(strings, self.lang.code()));
         self.signing_in = Some(task.abort_handle());
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -638,27 +653,25 @@ impl Shell {
 
     // -------------------------------------------------------------- update
 
-    /// Hands the downloaded installer to the system.
-    fn install(&self) {
-        if let Some(update) = &self.update {
-            update::open(&update.installer);
-        }
-    }
-
-    /// The button in Settings: one check now, on top of the hourly one.
+    /// The button in Settings: is there a newer version? Only asks; nothing
+    /// is downloaded until the user says Update.
     fn check_update(&mut self, cx: &mut Context<Self>) {
-        if self.checking_update {
+        if !matches!(self.update, Update::None) {
             return;
         }
-        self.checking_update = true;
+        self.update = Update::Checking;
         self.update_note = "".into();
         cx.spawn(async move |this, cx| {
-            let result = RT.spawn(update::check_now()).await;
+            let result = RT.spawn(update::check()).await;
             let _ = this.update(cx, |this, cx| {
-                this.checking_update = false;
+                // The hourly check may have answered in the meantime.
+                if !matches!(this.update, Update::Checking) {
+                    return;
+                }
                 let s = this.lang.strings();
+                this.update = Update::None;
                 match result {
-                    Ok(Ok(Some(update))) => this.update = Some(update),
+                    Ok(Ok(Some(offer))) => this.update = Update::Available(offer),
                     Ok(Ok(None)) => this.update_note = s.up_to_date.into(),
                     failed => {
                         tracing::warn!("update check failed: {failed:?}");
@@ -670,6 +683,97 @@ impl Shell {
         })
         .detach();
         cx.notify();
+    }
+
+    /// Update: downloads the offered version and installs it, saying each
+    /// step. Ends at Restart, or where the app can't be replaced in place,
+    /// with the installer opened.
+    fn start_update(&mut self, cx: &mut Context<Self>) {
+        let Update::Available(offer) = &self.update else { return };
+        let offer = offer.clone();
+        self.update = Update::Downloading(offer.clone(), 0);
+        self.update_note = "".into();
+        let (progress, mut steps) = mpsc::unbounded_channel();
+        let install = RT.spawn(update::install(offer.clone(), progress));
+        cx.spawn(async move |this, cx| {
+            // The channel closes when `install` is done.
+            while let Some(step) = steps.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    this.update = match step {
+                        update::Progress::Downloading(percent) => Update::Downloading(offer.clone(), percent),
+                        update::Progress::Installing => Update::Installing(offer.clone()),
+                    };
+                    cx.notify();
+                });
+            }
+            let result = install.await;
+            let _ = this.update(cx, |this, cx| {
+                let s = this.lang.strings();
+                match result {
+                    Ok(Ok(update::Outcome::Installed)) => {
+                        tracing::info!(version = %offer.version, "update installed, waiting for a restart");
+                        this.notify_update(fill(s.installed, &offer.version), "restart", s.restart, cx);
+                        this.update = Update::Installed(offer.version);
+                    }
+                    Ok(Ok(update::Outcome::Installer(installer))) => {
+                        update::open(&installer);
+                        this.update = Update::Downloaded(offer.version, installer);
+                    }
+                    failed => {
+                        tracing::warn!("update failed: {failed:?}");
+                        this.update = Update::Available(offer); // Update can be pressed again
+                        this.update_note = s.update_failed.into();
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Where the update could not be installed in place: hands the downloaded
+    /// installer to the system again.
+    fn open_installer(&self) {
+        if let Update::Downloaded(_, installer) = &self.update {
+            update::open(installer);
+        }
+    }
+
+    /// A system notification about the update, with the one button that takes it further.
+    fn notify_update(&self, body: String, action: &'static str, label: &'static str, cx: &mut Context<Self>) {
+        cx.show_system_notification(SystemNotification {
+            tag: "update".into(),
+            title: self.lang.strings().update_available.into(),
+            body: body.into(),
+            actions: vec![SystemNotificationAction { id: action.into(), label: label.into() }],
+        });
+    }
+
+    /// The update's current step in words, for the ribbon and for Settings.
+    fn update_status(&self) -> Option<String> {
+        let s = self.lang.strings();
+        match &self.update {
+            Update::None | Update::Checking => None,
+            Update::Available(offer) => Some(fill(s.version_available, &offer.version)),
+            Update::Downloading(offer, percent) => Some(format!("{} · {percent}%", fill(s.downloading, &offer.version))),
+            Update::Installing(offer) => Some(fill(s.installing, &offer.version)),
+            Update::Installed(version) => Some(fill(s.installed, version)),
+            Update::Downloaded(version, _) => Some(fill(s.update_ready, version)),
+        }
+    }
+
+    /// The button that takes the update one step further, if this step has one.
+    /// `place` keeps the ribbon's and the Settings row's buttons apart.
+    fn update_button(&self, place: &'static str, kind: Kind, cx: &mut Context<Self>) -> Option<Button> {
+        let s = self.lang.strings();
+        let id = |name: &str| SharedString::from(format!("{name}{place}"));
+        match &self.update {
+            Update::Available(_) => Some(button(id("update"), s.update_now, kind, true, cx).on_click(cx.listener(|this, _, _, cx| this.start_update(cx)))),
+            Update::Installed(_) => Some(button(id("restart"), s.restart, kind, true, cx).on_click(cx.listener(|_, _, _, cx| cx.restart()))),
+            Update::Downloaded(..) => Some(button(id("install"), s.install, kind, true, cx).on_click(cx.listener(|this, _, _, _| this.open_installer()))),
+            Update::None | Update::Checking | Update::Downloading(..) | Update::Installing(_) => None,
+        }
     }
 
     // ---------------------------------------------------------------- tray
@@ -986,17 +1090,18 @@ impl Shell {
             }),
         );
 
-        let updates = match &self.update {
-            Some(update) => setting(IconName::Download, s.updates, fill(s.update_ready, &update.version), p)
-                .child(button("install-settings", s.install, Kind::Solid, true, cx).on_click(cx.listener(|this, _, _, _| this.install()))),
-            None => {
-                let status = if self.update_note.is_empty() { SharedString::from(BUILD) } else { self.update_note.clone() };
-                setting(IconName::Download, s.updates, status, p).child(
-                    button("check-updates", if self.checking_update { s.checking_updates } else { s.check_updates }, Kind::Default, true, cx)
-                        .on_click(cx.listener(|this, _, _, cx| this.check_update(cx))),
-                )
-            }
-        };
+        // The step the update is at, else what the last check said, else the version.
+        let status = self.update_status().map(SharedString::from).unwrap_or_else(|| match self.update_note.is_empty() {
+            true => BUILD.into(),
+            false => self.update_note.clone(),
+        });
+        let updates = setting(IconName::Download, s.updates, status, p).children(match self.update {
+            Update::None | Update::Checking => Some(
+                button("check-updates", if matches!(self.update, Update::Checking) { s.checking_updates } else { s.check_updates }, Kind::Default, true, cx)
+                    .on_click(cx.listener(|this, _, _, cx| this.check_update(cx))),
+            ),
+            _ => self.update_button("-settings", Kind::Solid, cx),
+        });
 
         v_flex()
             .size_full()
@@ -1032,7 +1137,10 @@ impl Shell {
                             setting(IconName::KeyRound, s.passkeys, s.passkeys_hint, p).child(
                                 button("passkeys", s.manage_in_browser, Kind::Default, true, cx)
                                     .icon(Icon::new(IconName::ExternalLink))
-                                    .on_click(|_, _, _| update::open_external(format!("{}/account", api::base()))),
+                                    .on_click({
+                                        let lang = self.lang.code(); // the page opens in the app's language
+                                        move |_, _, _| update::open_external(format!("{}/account?lang={lang}", api::base()))
+                                    }),
                             ),
                         ),
                     )
@@ -1085,10 +1193,12 @@ impl Render for Shell {
         let s = self.lang.strings();
         // Ribbons across the top of every screen. They are part of the layout,
         // so the screen below starts under them instead of being covered.
-        let update = self.update.as_ref().map(|update| {
-            ribbon(Tone::Info, IconName::Download, fill(s.update_ready, &update.version), p)
-                .child(button("install", s.install, Kind::Filled(Tone::Info), true, cx).on_click(cx.listener(|this, _, _, _| this.install())))
-        });
+        // Good news once the new version is in place; news until then.
+        let (tone, glyph) = match self.update {
+            Update::Installed(_) => (Tone::Success, IconName::CircleCheck),
+            _ => (Tone::Info, IconName::Download),
+        };
+        let update = self.update_status().map(|status| ribbon(tone, glyph, status, p).children(self.update_button("", Kind::Filled(tone), cx)));
         let leftovers = self.leftovers.then(|| {
             ribbon(Tone::Warning, IconName::TriangleAlert, s.leftovers_found, p).child(
                 button("repair-banner", if self.repairing { s.repairing } else { s.repair_network }, Kind::Filled(Tone::Warning), true, cx)
@@ -1527,7 +1637,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     // No `use super::*`: the gpui_kit glob would shadow Rust's #[test].
-    use super::{Lang, Link, Screen, Shell, Traffic, WINDOW, apply_palette, bytes, clock};
+    use super::{Lang, Link, Screen, Shell, Traffic, Update, WINDOW, apply_palette, bytes, clock};
     use gpui_kit::{
         AppContext, Bounds, HeadlessAppContext, TestAppContext, WindowBounds, WindowOptions,
         component::{Theme, ThemeMode},
@@ -1577,29 +1687,37 @@ mod tests {
             window.click("settings", cx);
             assert!(window.try_find("totp-setup").is_some());
             assert!(window.try_find("en").is_some() && window.try_find("ru").is_some(), "language switch");
-            // Settings offers a check until an update is there, then the install.
-            assert!(window.try_find("check-updates").is_some() && window.try_find("install-settings").is_none());
+            // Settings offers a check; an offer turns it into Update, here and in
+            // the ribbon on top of every screen, the sign-in one included.
+            assert!(window.try_find("check-updates").is_some() && window.try_find("update-settings").is_none());
+            let offer = || crate::update::Offer { version: "9.9.9".into(), name: "bkn-proxy-test.dmg".into(), sha256: "".into() };
             shell.update(cx, |shell, cx| {
-                shell.update = Some(crate::update::Update { version: "9.9.9".into(), installer: "bkn-proxy.dmg".into() });
+                shell.update = Update::Available(offer());
                 cx.notify();
             });
             window.render_frame(cx);
-            assert!(window.try_find("install-settings").is_some() && window.try_find("check-updates").is_none());
-            // The update ribbon is on top of every screen, the sign-in one included.
-            assert!(window.try_find("install").is_some());
+            assert!(window.try_find("update-settings").is_some() && window.try_find("update").is_some() && window.try_find("check-updates").is_none());
+            // While it downloads there is nothing to press; once in place, Restart.
+            shell.update(cx, |shell, cx| {
+                shell.update = Update::Downloading(offer(), 40);
+                cx.notify();
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("update").is_none() && window.try_find("restart").is_none());
             shell.update(cx, |shell, cx| {
                 shell.screen = Screen::Login;
+                shell.update = Update::Installed("9.9.9".into());
                 cx.notify();
             });
             window.render_frame(cx);
-            assert!(window.try_find("login").is_some() && window.try_find("install").is_some());
+            assert!(window.try_find("login").is_some() && window.try_find("restart").is_some());
             shell.update(cx, |shell, cx| {
                 shell.screen = Screen::Settings;
-                shell.update = None;
+                shell.update = Update::None;
                 cx.notify();
             });
             window.render_frame(cx);
-            assert!(window.try_find("install").is_none());
+            assert!(window.try_find("restart").is_none() && window.try_find("check-updates").is_some());
 
             // The password fields open under their row and close again.
             assert!(window.try_find("password-save").is_none());
@@ -1670,6 +1788,7 @@ mod tests {
         let (window, shell) =
             cx.update(|cx| gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| Shell::new(None, Lang::En, window, cx)))).unwrap();
         let proxy = |id, name: &str| Proxy { id, name: name.into(), url: format!("socks5://u:secret@10.0.0.{id}:1080") };
+        let offer = || crate::update::Offer { version: "0.3.1".into(), name: "bkn-proxy-test.dmg".into(), sha256: "".into() };
 
         for (mode, lang) in [(ThemeMode::Light, Lang::En), (ThemeMode::Dark, Lang::En), (ThemeMode::Light, Lang::Ru)] {
             let mut shot = |name: &str, set: &dyn Fn(&mut Shell)| {
@@ -1706,7 +1825,7 @@ mod tests {
                 shell.link = Link::Off;
                 shell.me = Some(Me { email: "test@example.com".into(), totp_enabled: false });
                 shell.renaming = None;
-                shell.update = None;
+                shell.update = Update::None;
                 shell.proxies = vec![proxy(1, "Frankfurt"), proxy(2, "Amsterdam"), proxy(3, "Home server")];
             });
             shot("4-connected", &|shell| {
@@ -1735,7 +1854,7 @@ mod tests {
                 shell.screen = Screen::Proxies;
                 shell.leftovers = true;
                 shell.renaming = None;
-                shell.update = None;
+                shell.update = Update::None;
             });
             shot("6-rename-and-update", &|shell| {
                 shell.screen = Screen::Proxies;
@@ -1743,9 +1862,20 @@ mod tests {
                 shell.link = Link::Off;
                 shell.traffic = None;
                 shell.renaming = Some(2);
-                shell.update = Some(crate::update::Update { version: "0.2.0".into(), installer: "bkn-proxy-0.2.0.dmg".into() });
+                shell.update = Update::Available(offer());
+            });
+            shot("10-update-downloading", &|shell| {
+                shell.leftovers = false;
+                shell.renaming = None;
+                shell.update = Update::Downloading(offer(), 42);
+            });
+            shot("11-update-installed", &|shell| {
+                shell.screen = Screen::Settings;
+                shell.update = Update::Installed("0.3.1".into());
             });
             shot("8-checking", &|shell| {
+                shell.screen = Screen::Proxies;
+                shell.update = Update::None;
                 shell.me = None;
                 shell.leftovers = false;
                 shell.renaming = None;

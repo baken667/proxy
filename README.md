@@ -27,9 +27,11 @@ Built with Rust, [GPUI](https://www.gpui.rs) and
   uses and how many bytes went through: no addresses, no DNS names. The
   server's backoffice shows who is online and the traffic.
 - English and Russian, light and dark; a fixed-size window.
-- Checks for a newer version every hour and from a button in Settings,
-  downloads and verifies it, then says so in a system notification and in a
-  ribbon across the top of every screen, with an Install button.
+- Looks for a newer version every hour and from a button in Settings, and
+  says when there is one: in a system notification and in a ribbon across the
+  top of every screen. Update downloads it, shows the progress and, on macOS,
+  puts it in the app's place without opening the disk image; Restart then
+  runs it.
 
 ## Run from source
 
@@ -67,8 +69,11 @@ the helper.
 How the helper gets its rights:
 
 - macOS asks for the administrator password once. The first Connect copies
-  the binary to `/Library/PrivilegedHelperTools/kz.bkn.proxy.helper` and
-  registers it with launchd (`/Library/LaunchDaemons/kz.bkn.proxy.helper.plist`).
+  the app to `/Library/PrivilegedHelperTools/kz.bkn.proxy.helper.app`, where
+  only root can change it, and registers the executable in that copy with
+  launchd (`/Library/LaunchDaemons/kz.bkn.proxy.helper.plist`). The whole app
+  and not just the executable: a signed executable is bound to the bundle
+  around it, and macOS refuses to run it alone.
   From then on launchd starts the helper whenever the app opens the service's
   socket, and the helper exits when the app closes it. An update asks again
   only when it changes the helper itself (`src/tunnel.rs`, `src/net.rs` or a
@@ -79,7 +84,7 @@ How the helper gets its rights:
 To remove the service from a Mac:
 
 ```bash
-sudo launchctl bootout system/kz.bkn.proxy.helper; sudo rm /Library/LaunchDaemons/kz.bkn.proxy.helper.plist /Library/PrivilegedHelperTools/kz.bkn.proxy.helper
+sudo launchctl bootout system/kz.bkn.proxy.helper; sudo rm -rf /Library/LaunchDaemons/kz.bkn.proxy.helper.plist /Library/PrivilegedHelperTools/kz.bkn.proxy.helper.app
 ```
 
 On macOS and Windows every network change undoes itself if the helper goes
@@ -119,11 +124,22 @@ BKN_API_URL=https://example.com scripts/package-macos.sh
 
 ### Updates
 
-The app fetches `latest.json` and `latest.json.sig` from the server's
+A check fetches `latest.json` and `latest.json.sig` from the server's
 `/downloads`, and accepts the manifest only if it is signed by the key whose
-public half was given to the build as `BKN_UPDATE_KEY`. It then downloads the
-installer for its platform and checks it against the manifest's SHA-256. A
-build without `BKN_UPDATE_KEY` never checks for updates. Creating the key is
+public half was given to the build as `BKN_UPDATE_KEY`. Nothing else is
+downloaded until the user presses Update. Then the app downloads the
+installer for its platform and checks it against the manifest's SHA-256.
+
+On macOS it mounts the disk image out of sight, copies the new app next to
+the installed one and swaps the two by renaming, so a failure on the way
+leaves the installed app as it was; Restart runs the new one. Where that is
+not possible (Windows, Linux, or an app folder the user can't write to) the
+installer is opened instead, as before. A build without `BKN_UPDATE_KEY`
+never checks for updates.
+
+Before tagging a release that changes how the helper is installed or how the
+app is replaced, run the workflow by hand and try its signed disk image: an
+unsigned local build does not behave like the signed one there. Creating the key is
 described in `scripts/release-manifest.sh`.
 
 ## Languages and design

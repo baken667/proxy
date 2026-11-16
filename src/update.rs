@@ -1,12 +1,24 @@
-//! Update check. The server publishes a small manifest, signed with a key
-//! whose public half is baked into the app at build time (BKN_UPDATE_KEY).
-//! The app downloads the installer for its platform, checks it against the
-//! manifest, and then offers to open it: installing stays the user's click.
+//! Updates, in three steps the user can tell apart:
+//!
+//! 1. `check` reads a small manifest the server publishes, signed with a key
+//!    whose public half is baked into the app at build time (BKN_UPDATE_KEY).
+//!    It downloads nothing else, so it answers at once: there is a newer
+//!    version, or there isn't.
+//! 2. `install`, on the user's click, downloads the installer for this
+//!    platform and checks it against the manifest.
+//! 3. On macOS it then puts the new app in the place of the running one,
+//!    without opening the disk image; a restart finishes the update. Where
+//!    that can't be done (Windows, Linux, an app folder this user can't write
+//!    to) the installer is handed to the system instead, as before.
 //!
 //! The signature is what makes this safe. Whoever controls the download host
 //! can serve any file, but not one this app will accept. A build without the
 //! key, which is every dev build, never looks for updates.
-use std::{collections::HashMap, path::PathBuf, time::Duration};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use aws_lc_rs::signature::{ED25519, UnparsedPublicKey};
@@ -29,11 +41,29 @@ struct File {
     sha256: String,
 }
 
-/// A newer version, downloaded and checked, ready to be opened.
-#[derive(Debug)]
-pub struct Update {
+/// A newer version the signed manifest offers this platform.
+#[derive(Clone, Debug)]
+pub struct Offer {
     pub version: String,
-    pub installer: PathBuf,
+    /// The installer's file name under /downloads, and what its bytes must hash to.
+    pub name: String,
+    pub sha256: String,
+}
+
+/// What `install` is doing, for the interface to say.
+pub enum Progress {
+    /// Percent of the installer received.
+    Downloading(u8),
+    Installing,
+}
+
+/// How `install` ended.
+#[derive(Debug)]
+pub enum Outcome {
+    /// The new app is in place; it runs after a restart.
+    Installed,
+    /// It could not be put in place here: the installer, for the system to open.
+    Installer(PathBuf),
 }
 
 /// "0.10.2" is newer than "0.9.9". A version that isn't dotted numbers is
@@ -71,47 +101,121 @@ fn public_key() -> Option<Vec<u8>> {
     option_env!("BKN_UPDATE_KEY").and_then(|key| STANDARD.decode(key).ok())
 }
 
-/// One check at a time: the timer and the button in Settings would otherwise
-/// write the same installer file at once.
-static CHECKING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// One check, now: for the button in Settings.
-pub async fn check_now() -> Result<Option<Update>> {
-    check(&public_key().context("this build has no update key")?).await
+/// Is there a newer version? Reads the manifest and nothing else.
+pub async fn check() -> Result<Option<Offer>> {
+    let public_key = public_key().context("this build has no update key")?;
+    let manifest = crate::api::download("latest.json", |_| {}).await?;
+    let signature = crate::api::download("latest.json.sig", |_| {}).await?;
+    let manifest = verified(&manifest, &signature, &public_key)?;
+    let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+    let file = pick(&manifest, env!("CARGO_PKG_VERSION"), &platform)?;
+    Ok(file.map(|file| Offer { version: manifest.version.clone(), name: file.name.clone(), sha256: file.sha256.to_lowercase() }))
 }
 
-async fn check(public_key: &[u8]) -> Result<Option<Update>> {
-    let _one_at_a_time = CHECKING.lock().await;
-    let manifest = crate::api::download("latest.json").await?;
-    let signature = crate::api::download("latest.json.sig").await?;
-    let manifest = verified(&manifest, &signature, public_key)?;
-    let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
-    let Some(file) = pick(&manifest, env!("CARGO_PKG_VERSION"), &platform)? else {
-        return Ok(None);
-    };
-
-    let installer = dirs::download_dir().or_else(dirs::cache_dir).context("no folder to download into")?.join(&file.name);
-    let expected = file.sha256.to_lowercase();
+/// Downloads the offered installer, checks it and installs it. The steps are
+/// reported to `progress` as they begin.
+pub async fn install(offer: Offer, progress: UnboundedSender<Progress>) -> Result<Outcome> {
+    let installer = dirs::download_dir().or_else(dirs::cache_dir).context("no folder to download into")?.join(&offer.name);
     // Left there by an earlier run? Then don't fetch it again, but only if it still matches.
-    let already = tokio::fs::read(&installer).await.is_ok_and(|bytes| sha256_hex(&bytes) == expected);
+    let already = tokio::fs::read(&installer).await.is_ok_and(|bytes| sha256_hex(&bytes) == offer.sha256);
     if !already {
-        let bytes = crate::api::download(&file.name).await?;
-        ensure!(sha256_hex(&bytes) == expected, "the downloaded update does not match its manifest");
+        let _ = progress.send(Progress::Downloading(0));
+        let bytes = crate::api::download(&offer.name, |percent| drop(progress.send(Progress::Downloading(percent)))).await?;
+        ensure!(sha256_hex(&bytes) == offer.sha256, "the downloaded update does not match its manifest");
         tokio::fs::write(&installer, bytes).await?;
     }
-    Ok(Some(Update { version: manifest.version, installer }))
+    let _ = progress.send(Progress::Installing);
+    let disk_image = installer.clone();
+    match tokio::task::spawn_blocking(move || in_place(&disk_image)).await? {
+        Ok(true) => {
+            let _ = tokio::fs::remove_file(&installer).await; // it has done its work
+            Ok(Outcome::Installed)
+        }
+        Ok(false) => Ok(Outcome::Installer(installer)),
+        Err(error) => {
+            tracing::warn!("could not update in place, handing the installer to the system: {error:#}");
+            Ok(Outcome::Installer(installer))
+        }
+    }
 }
 
-/// Looks for an update now and every hour until one is ready. A check is
-/// two small files, so an hour costs nothing and a release reaches a running
-/// app within one.
-pub async fn watch(found: UnboundedSender<Update>) {
-    let Some(public_key) = public_key() else { return };
+/// Puts the app from the downloaded disk image in the place of the one that
+/// is running. False when this is not an installed app (`cargo run`).
+#[cfg(target_os = "macos")]
+fn in_place(disk_image: &Path) -> Result<bool> {
+    let exe = std::env::current_exe()?;
+    match bundle_of(&exe) {
+        Some(bundle) => replace_bundle(disk_image, bundle).map(|()| true),
+        None => Ok(false),
+    }
+}
+
+// ponytail: Windows and Linux still get the downloaded archive opened for
+// them. In place there means swapping a running .exe; do it when those
+// platforms are worth the testing.
+#[cfg(not(target_os = "macos"))]
+fn in_place(_: &Path) -> Result<bool> {
+    Ok(false)
+}
+
+/// `/Applications/bkn-proxy.app` for `/Applications/bkn-proxy.app/Contents/MacOS/bkn-proxy`.
+#[cfg(target_os = "macos")]
+pub fn bundle_of(exe: &Path) -> Option<&Path> {
+    exe.ancestors().nth(3).filter(|bundle| bundle.extension().is_some_and(|extension| extension == "app"))
+}
+
+/// The app's name inside the disk image (scripts/package-macos.sh).
+#[cfg(target_os = "macos")]
+const APP_IN_IMAGE: &str = "bkn-proxy.app";
+
+/// Copies the new app next to the old one, then swaps the two by renaming.
+/// Until the swap nothing of the installed app has changed, so a failure on
+/// the way leaves it as it was. The running process keeps its own files: a
+/// renamed or deleted bundle stays open for whoever has it open.
+#[cfg(target_os = "macos")]
+fn replace_bundle(disk_image: &Path, bundle: &Path) -> Result<()> {
+    let run = |program: &str, args: &[&std::ffi::OsStr]| -> Result<()> {
+        let out = std::process::Command::new(program).args(args).output().with_context(|| format!("can't run {program}"))?;
+        ensure!(out.status.success(), "{program}: {}", String::from_utf8_lossy(&out.stderr).trim());
+        Ok(())
+    };
+    let folder = bundle.parent().context("the app has no folder")?;
+    let (new, old) = (folder.join(".bkn-proxy-update.app"), folder.join(".bkn-proxy-old.app"));
+    let mount = std::env::temp_dir().join(format!("bkn-proxy-update-{}", std::process::id()));
+    std::fs::create_dir_all(&mount)?;
+    // Mounted out of sight: no Finder window, no icon on the desktop.
+    run("hdiutil", &["attach".as_ref(), "-nobrowse".as_ref(), "-readonly".as_ref(), "-mountpoint".as_ref(), mount.as_ref(), disk_image.as_ref()])?;
+    let copied = (|| {
+        let _ = std::fs::remove_dir_all(&new); // left by an attempt that was cut short
+        // ditto is what copies an app whole: links, permissions and the signature's extended attributes.
+        run("ditto", &[mount.join(APP_IN_IMAGE).as_ref(), new.as_ref()])
+    })();
+    let _ = run("hdiutil", &["detach".as_ref(), mount.as_ref(), "-force".as_ref()]);
+    let _ = std::fs::remove_dir(&mount);
+    copied?;
+
+    let _ = std::fs::remove_dir_all(&old);
+    std::fs::rename(bundle, &old).context("can't move the installed app aside")?;
+    if let Err(error) = std::fs::rename(&new, bundle) {
+        let _ = std::fs::rename(&old, bundle); // put the old one back
+        return Err(error).context("can't move the new app into place");
+    }
+    let _ = std::fs::remove_dir_all(&old);
+    Ok(())
+}
+
+/// Looks for an update now and every hour until there is one. A check is two
+/// small files, so an hour costs nothing and a release reaches a running app
+/// within one.
+pub async fn watch(found: UnboundedSender<Offer>) {
+    if public_key().is_none() {
+        return;
+    }
     loop {
-        match check(&public_key).await {
-            Ok(Some(update)) => {
-                tracing::info!(version = %update.version, "update downloaded");
-                let _ = found.send(update);
+        match check().await {
+            Ok(Some(offer)) => {
+                tracing::info!(version = %offer.version, "update available");
+                let _ = found.send(offer);
                 return;
             }
             Ok(None) => tracing::debug!("no update"),
@@ -121,8 +225,8 @@ pub async fn watch(found: UnboundedSender<Update>) {
     }
 }
 
-/// Hands the installer to the system: mounts the .dmg, or runs the .exe.
-pub fn open(installer: &std::path::Path) {
+/// Hands the installer to the system: mounts the .dmg, or opens the archive.
+pub fn open(installer: &Path) {
     open_external(installer.as_os_str());
 }
 
@@ -180,5 +284,42 @@ mod tests {
         assert_eq!(verified(br#"{"version":"9.9.9","files":{}}"#, &openssl_signature, &openssl_key).unwrap().version, "9.9.9");
 
         assert_eq!(sha256_hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
+    /// A real disk image, mounted and copied by the system's own tools: the
+    /// app in it takes the place of the installed one, and nothing is left
+    /// lying next to it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_app_is_replaced_in_place() {
+        assert_eq!(bundle_of(Path::new("/Applications/bkn-proxy.app/Contents/MacOS/bkn-proxy")), Some(Path::new("/Applications/bkn-proxy.app")));
+        assert_eq!(bundle_of(Path::new("/code/target/debug/bkn-proxy")), None, "cargo run is not an installed app");
+
+        let dir = std::env::temp_dir().join(format!("bkn-proxy-test-update-{}", std::process::id()));
+        let app = |root: &Path, name: &str, version: &str| {
+            std::fs::create_dir_all(root.join(name).join("Contents/MacOS")).unwrap();
+            std::fs::write(root.join(name).join("Contents/MacOS/bkn-proxy"), version).unwrap();
+        };
+        app(&dir.join("image"), APP_IN_IMAGE, "new");
+        app(&dir.join("Applications"), "Renamed by the user.app", "old");
+        let disk_image = dir.join("update.dmg");
+        let made = std::process::Command::new("hdiutil")
+            .args(["create", "-quiet", "-volname", "bkn-proxy-test", "-format", "UDZO", "-srcfolder"])
+            .args([dir.join("image"), disk_image.clone()])
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+
+        let installed = dir.join("Applications/Renamed by the user.app");
+        replace_bundle(&disk_image, &installed).unwrap();
+        assert_eq!(std::fs::read_to_string(installed.join("Contents/MacOS/bkn-proxy")).unwrap(), "new");
+        let left: Vec<_> = std::fs::read_dir(dir.join("Applications")).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        assert_eq!(left, ["Renamed by the user.app"], "no copy and no old app left behind");
+
+        // Not a disk image: the installed app is untouched.
+        std::fs::write(&disk_image, "not an image").unwrap();
+        assert!(replace_bundle(&disk_image, &installed).is_err());
+        assert_eq!(std::fs::read_to_string(installed.join("Contents/MacOS/bkn-proxy")).unwrap(), "new");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

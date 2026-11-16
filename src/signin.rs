@@ -38,14 +38,15 @@ pub fn device_name() -> &'static str {
 }
 
 /// Opens the browser, waits for the user to sign in (up to ten minutes) and
-/// returns this device's session token.
-pub async fn sign_in(s: &'static Strings) -> Result<String> {
+/// returns this device's session token. `lang` is the app's language code:
+/// the sign-in page opens in it rather than in the browser's.
+pub async fn sign_in(s: &'static Strings, lang: &'static str) -> Result<String> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let port = listener.local_addr()?.port();
     let verifier = random(32);
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     let state = random(16);
-    crate::update::open_external(&format!("{}/login?app={port}&challenge={challenge}&state={state}", api::base()));
+    crate::update::open_external(&format!("{}/login?app={port}&challenge={challenge}&state={state}&lang={lang}", api::base()));
 
     let code = tokio::time::timeout(Duration::from_secs(600), async {
         loop {

@@ -110,9 +110,17 @@ pub struct Strings {
     pub rename_hint: &'static str,
     pub save: &'static str,
     pub cancel: &'static str,
-    /// `{}` is a version number.
+    /// The update's steps; `{}` is a version number.
+    pub version_available: &'static str,
+    pub update_now: &'static str,
+    pub downloading: &'static str,
+    pub installing: &'static str,
+    pub installed: &'static str,
+    pub restart: &'static str,
+    /// Where the app can't be replaced in place: the installer is downloaded, Install opens it.
     pub update_ready: &'static str,
     pub install: &'static str,
+    pub update_failed: &'static str,
     /// The title of the system notification about a new version.
     pub update_available: &'static str,
 
@@ -234,8 +242,15 @@ const EN: Strings = Strings {
     rename_hint: "Only you see this name. Leave it empty to go back to the original.",
     save: "Save",
     cancel: "Cancel",
+    version_available: "Version {} is available",
+    update_now: "Update",
+    downloading: "Downloading version {}",
+    installing: "Installing version {}…",
+    installed: "Version {} is installed",
+    restart: "Restart",
     update_ready: "Version {} is downloaded",
     install: "Install",
+    update_failed: "Could not install the update",
     update_available: "Update available",
 
     back: "Back",
@@ -329,8 +344,15 @@ const RU: Strings = Strings {
     rename_hint: "Это название видите только вы. Оставьте поле пустым, чтобы вернуть исходное.",
     save: "Сохранить",
     cancel: "Отмена",
+    version_available: "Доступна версия {}",
+    update_now: "Обновить",
+    downloading: "Загрузка версии {}",
+    installing: "Установка версии {}…",
+    installed: "Версия {} установлена",
+    restart: "Перезапустить",
     update_ready: "Версия {} загружена",
     install: "Установить",
+    update_failed: "Не удалось установить обновление",
     update_available: "Доступно обновление",
 
     back: "Назад",
@@ -399,7 +421,7 @@ mod tests {
         // template kept its placeholder.
         for lang in Lang::ALL {
             let s = lang.strings();
-            for template in [s.for_time, s.in_total, s.peak, s.per_second, s.session_not_saved, s.update_ready] {
+            for template in [s.for_time, s.in_total, s.peak, s.per_second, s.session_not_saved, s.update_ready, s.version_available, s.downloading, s.installing, s.installed] {
                 assert!(template.contains("{}"), "{lang:?}: {template:?} lost its {{}}");
             }
             assert_eq!(Lang::from_code(lang.code()), Some(lang));
