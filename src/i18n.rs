@@ -71,6 +71,8 @@ pub struct Strings {
     pub sign_in: &'static str,
     pub sign_in_hint: &'static str,
     pub waiting_browser: &'static str,
+    /// A saved session the server has not confirmed yet.
+    pub checking_session: &'static str,
     /// Shown in the browser tab after sign-in.
     pub signed_in_browser: &'static str,
     pub open_window: &'static str,
@@ -187,6 +189,7 @@ const EN: Strings = Strings {
     sign_in: "Sign in with the browser",
     sign_in_hint: "Your browser opens the sign-in page. Password, 2FA code and passkeys all work there.",
     waiting_browser: "Finish signing in in your browser…",
+    checking_session: "Checking your session…",
     signed_in_browser: "You are signed in. Go back to bkn-proxy; this tab can be closed.",
     open_window: "Open bkn-proxy",
     quit: "Quit",
@@ -270,6 +273,7 @@ const RU: Strings = Strings {
     sign_in: "Войти через браузер",
     sign_in_hint: "Откроется страница входа в браузере. Там работают пароль, код 2FA и ключи доступа.",
     waiting_browser: "Завершите вход в браузере…",
+    checking_session: "Проверяем вход…",
     signed_in_browser: "Вход выполнен. Вернитесь в bkn-proxy — эту вкладку можно закрыть.",
     open_window: "Открыть bkn-proxy",
     quit: "Выйти из программы",

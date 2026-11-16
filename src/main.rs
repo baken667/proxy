@@ -46,9 +46,16 @@ fn host(url: &str) -> &str {
     url.rsplit(['@', '/']).next().unwrap_or_default()
 }
 
+/// The saved session: one keychain entry per server, as a token is only good
+/// for the server that issued it. It also keeps a dev build (localhost) off
+/// the installed app's entry: macOS asks for the keychain password whenever
+/// an app reads an entry that a differently signed one wrote.
 fn keychain() -> Option<keyring::Entry> {
-    keyring::Entry::new("bkn-proxy", "session").ok()
+    keyring::Entry::new("bkn-proxy", &api::base()).ok()
 }
+
+/// "bkn-proxy 0.2.2 · a1b2c3d": the version and the commit it was built from.
+const BUILD: &str = concat!("bkn-proxy ", env!("CARGO_PKG_VERSION"), " · ", env!("BKN_COMMIT"));
 
 #[derive(PartialEq)]
 enum Screen {
@@ -382,7 +389,12 @@ impl Shell {
                 let result = RT.spawn(api::snapshot(token.clone())).await;
                 let updated = this.update(cx, |this, cx| {
                     match result {
-                        Ok(Ok((me, proxies))) => this.apply(me, proxies),
+                        Ok(Ok((me, proxies))) => {
+                            if this.me.is_none() {
+                                this.note = "".into(); // whatever kept the session from being confirmed is over
+                            }
+                            this.apply(me, proxies)
+                        }
                         Ok(Err(error)) => this.fail(error, cx),
                         Err(_) => {}
                     }
@@ -393,6 +405,12 @@ impl Shell {
                 }
             }
         }));
+    }
+
+    fn log_out(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Best effort: the local session is dropped either way.
+        self.call(Method::POST, "/auth/logout", None, window, cx, |_, _: (), _, _| {});
+        self.signed_out(cx);
     }
 
     fn signed_out(&mut self, cx: &mut Context<Self>) {
@@ -648,6 +666,22 @@ impl Shell {
             .children(self.note(p))
     }
 
+    /// There is a saved token, but the server has not answered for it yet, or
+    /// can't be reached. Nothing of the account is shown until it has.
+    fn checking_screen(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        let s = self.lang.strings();
+        v_flex()
+            .size_full()
+            .justify_center()
+            .gap(px(10.))
+            .child(h_flex().items_center().gap(px(14.)).child(self.mark(p, 72.)).child(wordmark(p, 30.)))
+            .child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child(s.checking_session))
+            .children(self.note(p))
+            .child(div().mt(px(10.)).child(
+                button("logout", s.sign_out, Kind::Default, false, cx).w_full().on_click(cx.listener(|this, _, window, cx| this.log_out(window, cx))),
+            ))
+    }
+
     fn proxies_screen(&self, p: Palette, cx: &mut Context<Self>) -> Div {
         let s = self.lang.strings();
         let active = self.active.and_then(|id| self.proxies.iter().find(|proxy| proxy.id == id));
@@ -839,11 +873,7 @@ impl Shell {
                     .children(self.note(p))
                     .child(
                         block(s.account, "", p).mt(px(20.)).child(pair(s.signed_in_as, email, p)).child(div().mt(px(16.)).child(
-                            button("logout", s.sign_out, Kind::Default, false, cx).w_full().on_click(cx.listener(|this, _, window, cx| {
-                                // Best effort: the local session is dropped either way.
-                                this.call(Method::POST, "/auth/logout", None, window, cx, |_, _: (), _, _| {});
-                                this.signed_out(cx);
-                            })),
+                            button("logout", s.sign_out, Kind::Default, false, cx).w_full().on_click(cx.listener(|this, _, window, cx| this.log_out(window, cx))),
                         )),
                     )
                     .child(two_factor)
@@ -885,7 +915,8 @@ impl Shell {
                             lang.save();
                             this.set_lang(lang, window, cx);
                         }))
-                    })))),
+                    }))))
+                    .child(label(BUILD, p).mt(px(52.))),
             )
     }
 
@@ -908,6 +939,8 @@ impl Render for Shell {
         let p = palette(cx.theme().is_dark());
         let body = match self.screen {
             Screen::Login => self.login_screen(p, cx),
+            // A saved token is not a session until the server has answered for it.
+            _ if self.me.is_none() => self.checking_screen(p, cx),
             Screen::Proxies => self.proxies_screen(p, cx),
             Screen::Settings => self.settings_screen(p, cx),
         };
@@ -1199,7 +1232,8 @@ fn main() {
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     // Logged before the keychain read: macOS may hold that read behind a
-    // permission prompt (it does after every rebuild of an unsigned binary).
+    // permission prompt (it does after every rebuild of an unsigned binary,
+    // and for an entry that a differently signed build wrote).
     tracing::info!("starting, reading the saved session from the keychain");
     let saved_token = keychain().and_then(|k| k.get_password().ok());
     tracing::info!(saved_session = saved_token.is_some(), "keychain read");
@@ -1256,6 +1290,14 @@ mod tests {
         cx.update_window(window, |_, window, cx| {
             window.render_frame(cx);
             assert!(window.try_find("login").is_some());
+
+            // A saved token the server has not confirmed: nothing of the account yet.
+            shell.update(cx, |shell, cx| {
+                shell.screen = Screen::Settings;
+                cx.notify();
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("logout").is_some() && window.try_find("totp-setup").is_none() && window.try_find("password").is_none());
 
             shell.update(cx, |shell, cx| {
                 shell.screen = Screen::Proxies;
@@ -1402,6 +1444,12 @@ mod tests {
                 shell.traffic = None;
                 shell.renaming = Some(2);
                 shell.update = Some(crate::update::Update { version: "0.2.0".into(), installer: "bkn-proxy-0.2.0.dmg".into() });
+            });
+            shot("8-checking", &|shell| {
+                shell.me = None;
+                shell.leftovers = false;
+                shell.renaming = None;
+                shell.note = lang.strings().offline.into();
             });
         }
     }
