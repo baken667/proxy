@@ -107,6 +107,11 @@ pub async fn watch(found: UnboundedSender<Update>) {
 
 /// Hands the installer to the system: mounts the .dmg, or runs the .exe.
 pub fn open(installer: &std::path::Path) {
+    open_external(installer.as_os_str());
+}
+
+/// Opens a file or a URL with whatever the system uses for it.
+pub fn open_external(target: impl AsRef<std::ffi::OsStr>) {
     let mut command = if cfg!(target_os = "macos") {
         std::process::Command::new("open")
     } else if cfg!(windows) {
@@ -116,8 +121,8 @@ pub fn open(installer: &std::path::Path) {
     } else {
         std::process::Command::new("xdg-open")
     };
-    if let Err(error) = command.arg(installer).spawn() {
-        tracing::error!("could not open the update: {error}");
+    if let Err(error) = command.arg(target.as_ref()).spawn() {
+        tracing::error!("could not open {:?}: {error}", target.as_ref());
     }
 }
 

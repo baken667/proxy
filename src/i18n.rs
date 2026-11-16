@@ -66,10 +66,18 @@ pub struct Strings {
 
     // Sign in
     pub login_hint: &'static str,
-    pub email: &'static str,
     pub password: &'static str,
     pub code: &'static str,
     pub sign_in: &'static str,
+    pub sign_in_hint: &'static str,
+    pub waiting_browser: &'static str,
+    /// Shown in the browser tab after sign-in.
+    pub signed_in_browser: &'static str,
+    pub open_window: &'static str,
+    pub quit: &'static str,
+    pub passkeys: &'static str,
+    pub passkeys_hint: &'static str,
+    pub manage_in_browser: &'static str,
 
     // Main screen
     pub settings: &'static str,
@@ -167,11 +175,18 @@ impl Strings {
 const EN: Strings = Strings {
     name: "English",
 
-    login_hint: "Sign in with the account your admin created.",
-    email: "Email",
+    login_hint: "Use the account your admin created.",
     password: "Password",
     code: "6-digit code",
-    sign_in: "Sign in",
+    sign_in: "Sign in with the browser",
+    sign_in_hint: "Your browser opens the sign-in page. Password, 2FA code and passkeys all work there.",
+    waiting_browser: "Finish signing in in your browser…",
+    signed_in_browser: "You are signed in. Go back to bkn-proxy; this tab can be closed.",
+    open_window: "Open bkn-proxy",
+    quit: "Quit",
+    passkeys: "Passkeys",
+    passkeys_hint: "Sign in with a fingerprint, your face or a security key instead of a password.",
+    manage_in_browser: "Manage in browser",
 
     settings: "Settings",
     connected: "Connected",
@@ -237,11 +252,18 @@ const EN: Strings = Strings {
 const RU: Strings = Strings {
     name: "Русский",
 
-    login_hint: "Войдите под учётной записью, которую создал администратор.",
-    email: "Эл. почта",
+    login_hint: "Используйте учётную запись, которую создал администратор.",
     password: "Пароль",
     code: "6-значный код",
-    sign_in: "Войти",
+    sign_in: "Войти через браузер",
+    sign_in_hint: "Откроется страница входа в браузере. Там работают пароль, код 2FA и ключи доступа.",
+    waiting_browser: "Завершите вход в браузере…",
+    signed_in_browser: "Вход выполнен. Вернитесь в bkn-proxy — эту вкладку можно закрыть.",
+    open_window: "Открыть bkn-proxy",
+    quit: "Выйти из программы",
+    passkeys: "Ключи доступа",
+    passkeys_hint: "Вход по отпечатку, лицу или аппаратному ключу вместо пароля.",
+    manage_in_browser: "Настроить в браузере",
 
     settings: "Настройки",
     connected: "Подключено",

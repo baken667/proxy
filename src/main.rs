@@ -1,6 +1,8 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 mod api;
 mod i18n;
+mod signin;
+mod tray;
 mod tunnel;
 mod update;
 mod wire;
@@ -9,7 +11,7 @@ use std::{
     borrow::Cow,
     collections::VecDeque,
     sync::{Arc, LazyLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use gpui_kit::{
@@ -73,15 +75,13 @@ struct Shell {
     note: SharedString,
     /// Something went right.
     info: SharedString,
-    need_totp: bool,
+    /// The browser sign-in in progress; dropping it does not stop it, aborting does.
+    signing_in: Option<tokio::task::AbortHandle>,
     totp_setup: Option<TotpSetup>,
     tunnel: Option<Tunnel>,
     launching: bool,
     tunnel_states: mpsc::UnboundedSender<String>,
     refresh: Option<mpsc::UnboundedSender<()>>,
-    email: Entity<InputState>,
-    password: Entity<InputState>,
-    login_code: Entity<InputState>,
     /// The proxy whose name is being edited, and the field it is edited in.
     renaming: Option<i64>,
     rename: Entity<InputState>,
@@ -92,6 +92,10 @@ struct Shell {
     current_password: Entity<InputState>,
     new_password: Entity<InputState>,
     totp_code: Entity<InputState>,
+    /// Picked for each connection, so the server can tell connections apart.
+    tunnel_id: Option<String>,
+    last_report: Option<Instant>,
+    tray: Option<tray::Tray>,
     _sync: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -106,24 +110,12 @@ impl Shell {
         let mut input = |placeholder: &'static str, masked: bool| {
             cx.new(|cx| InputState::new(window, cx).placeholder(placeholder).masked(masked))
         };
-        let email = input(s.email, false);
-        let password = input(s.password, true);
-        let login_code = input(s.code, false);
         let rename = input(s.rename_placeholder, false);
         let current_password = input(s.current_password, true);
         let new_password = input(s.new_password, true);
         let totp_code = input(s.code, false);
 
-        // Enter in any login field submits.
-        let mut _subscriptions: Vec<Subscription> = [&email, &password, &login_code]
-            .map(|field| {
-                cx.subscribe_in(field, window, |this: &mut Self, _, event: &InputEvent, window, cx| {
-                    if matches!(event, InputEvent::PressEnter { .. }) {
-                        this.login(window, cx);
-                    }
-                })
-            })
-            .into();
+        let mut _subscriptions: Vec<Subscription> = Vec::new();
         _subscriptions.push(cx.subscribe_in(&rename, window, |this: &mut Self, _, event: &InputEvent, window, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
                 this.save_rename(window, cx);
@@ -157,12 +149,17 @@ impl Shell {
                         if let (Some(sent), Some(received), Some(traffic)) = (counters.next(), counters.next(), this.traffic.as_mut()) {
                             traffic.tick(sent, received);
                         }
+                        this.report(false);
                     } else if state == "up" {
                         tracing::info!("tunnel up");
                         this.link = Link::On;
                         this.traffic = Some(Traffic::new());
+                        this.tunnel_id = Some(new_tunnel_id());
+                        this.report(true);
                     } else {
                         this.traffic = None;
+                        this.tunnel_id = None;
+                        this.report(true);
                         tracing::warn!("tunnel {state}");
                         this.active = None;
                         this.link = Link::Off;
@@ -171,6 +168,32 @@ impl Shell {
                     }
                     cx.notify();
                 });
+            }
+        })
+        .detach();
+
+        // Closing the window keeps the app (and the tunnel) running: the
+        // tray icon brings it back. macOS hides the app; elsewhere the window
+        // is minimized, as there is no hidden window state to return from.
+        window.on_window_should_close(cx, |window, cx| {
+            if cfg!(target_os = "macos") {
+                cx.hide();
+            } else {
+                window.minimize_window();
+            }
+            false
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(tray::POLL).await;
+                let alive = this.update_in(cx, |this, window, cx| {
+                    for action in tray::actions() {
+                        this.tray_action(action, window, cx);
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
             }
         })
         .detach();
@@ -186,15 +209,12 @@ impl Shell {
             traffic: None,
             note: "".into(),
             info: "".into(),
-            need_totp: false,
+            signing_in: None,
             totp_setup: None,
             tunnel: None,
             launching: false,
             tunnel_states,
             refresh: None,
-            email,
-            password,
-            login_code,
             renaming: None,
             rename,
             update: None,
@@ -202,6 +222,9 @@ impl Shell {
             current_password,
             new_password,
             totp_code,
+            tunnel_id: None,
+            last_report: None,
+            tray: None,
             _sync: None,
             _subscriptions,
         };
@@ -243,7 +266,6 @@ impl Shell {
     fn fail(&mut self, error: api::Error, cx: &mut Context<Self>) {
         tracing::warn!(code = %error.0, "api error");
         match error.0.as_str() {
-            "totp_required" => self.need_totp = true,
             // Session revoked: user disabled or deleted, password reset, logged out elsewhere.
             "unauthorized" if self.token.is_some() => self.signed_out(cx),
             _ => {}
@@ -266,9 +288,6 @@ impl Shell {
         gpui_kit::component::set_locale(lang.code()); // the library's own texts, e.g. the input context menu
         let s = lang.strings();
         let placeholders = [
-            (&self.email, s.email),
-            (&self.password, s.password),
-            (&self.login_code, s.code),
             (&self.rename, s.rename_placeholder),
             (&self.current_password, s.current_password),
             (&self.new_password, s.new_password),
@@ -282,26 +301,46 @@ impl Shell {
 
     // ---------------------------------------------------------------- auth
 
-    fn login(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let request = LoginRequest {
-            email: Self::value(&self.email, cx).trim().into(),
-            password: Self::value(&self.password, cx),
-            totp: self.need_totp.then(|| Self::value(&self.login_code, cx)),
-            device: Some(std::env::consts::OS.into()),
-        };
-        let body = serde_json::to_value(request).ok();
-        self.call(Method::POST, "/auth/login", body, window, cx, |this, response: LoginResponse, window, cx| {
-            if let Some(Err(error)) = keychain().map(|k| k.set_password(&response.token)) {
-                this.note = fill(this.lang.strings().session_not_saved, &error.to_string()).into();
-            }
-            Self::clear(&[&this.password, &this.login_code], window, cx);
-            this.signed_in(response.token, cx);
-        });
+    /// Opens the browser's sign-in page and waits for it to hand back a token.
+    fn sign_in(&mut self, cx: &mut Context<Self>) {
+        self.note = "".into();
+        let strings = self.lang.strings();
+        let task = RT.spawn(signin::sign_in(strings));
+        self.signing_in = Some(task.abort_handle());
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.signing_in = None;
+                match result {
+                    Ok(Ok(token)) => {
+                        if let Some(Err(error)) = keychain().map(|k| k.set_password(&token)) {
+                            this.note = fill(this.lang.strings().session_not_saved, &error.to_string()).into();
+                        }
+                        this.signed_in(token, cx);
+                        cx.activate(true); // back from the browser
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!("browser sign-in failed: {error:#}");
+                        this.note = this.lang.strings().message(&error.to_string()).to_string().into();
+                    }
+                    Err(_) => {} // cancelled
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn cancel_sign_in(&mut self, cx: &mut Context<Self>) {
+        if let Some(task) = self.signing_in.take() {
+            task.abort();
+        }
+        cx.notify();
     }
 
     fn signed_in(&mut self, token: String, cx: &mut Context<Self>) {
         tracing::info!("signed in, syncing");
-        self.need_totp = false;
         self.screen = Screen::Proxies;
         self.token = Some(token.clone());
 
@@ -458,6 +497,61 @@ impl Shell {
         self.active = None;
         self.link = Link::Off;
         self.traffic = None;
+        if self.tunnel_id.take().is_some() {
+            self.report(true);
+        }
+    }
+
+    /// Tells the server what this device's tunnel is doing: on every change,
+    /// and every few seconds while connected. Only the proxy and byte counts.
+    fn report(&mut self, now: bool) {
+        let Some(token) = self.token.clone() else { return };
+        if !now && self.last_report.is_some_and(|at| at.elapsed() < Duration::from_secs(5)) {
+            return;
+        }
+        self.last_report = Some(Instant::now());
+        let tunnel = match (&self.tunnel_id, self.active, &self.traffic) {
+            (Some(id), Some(proxy_id), Some(traffic)) => json!({ "id": id, "proxy_id": proxy_id, "sent": traffic.sent, "received": traffic.received }),
+            _ => Value::Null,
+        };
+        RT.spawn(async move {
+            if let Err(error) = api::call::<()>(Method::POST, "/status", Some(&token), Some(json!({ "tunnel": tunnel }))).await {
+                tracing::debug!("status report failed: {}", error.0);
+            }
+        });
+    }
+
+    // ---------------------------------------------------------------- tray
+
+    fn tray_state(&self) -> tray::State {
+        let s = self.lang.strings();
+        let active = self.active.and_then(|id| self.proxies.iter().find(|p| p.id == id));
+        let status = match (&self.link, active) {
+            _ if self.token.is_none() => s.sign_in.to_string(),
+            (Link::On, Some(p)) => format!("{}: {}", s.connected, p.name),
+            (Link::Connecting, Some(p)) => format!("{}: {}", s.connecting, p.name),
+            _ => s.off.to_string(),
+        };
+        tray::State {
+            status,
+            proxies: self.proxies.iter().map(|p| (p.id, p.name.clone())).collect(),
+            active: self.active,
+            on: self.link == Link::On,
+        }
+    }
+
+    fn tray_action(&mut self, action: tray::Action, window: &mut Window, cx: &mut Context<Self>) {
+        match action {
+            tray::Action::Open => {
+                cx.activate(true);
+                window.activate_window();
+            }
+            tray::Action::Quit => cx.quit(),
+            tray::Action::Disconnect => self.disconnect(),
+            tray::Action::Connect(id) if self.active == Some(id) => self.disconnect(),
+            tray::Action::Connect(id) => self.connect(id, cx),
+        }
+        cx.notify();
     }
 
     // ------------------------------------------------------------- screens
@@ -480,20 +574,22 @@ impl Shell {
 
     fn login_screen(&self, p: Palette, cx: &mut Context<Self>) -> Div {
         let s = self.lang.strings();
+        let waiting = self.signing_in.is_some();
         v_flex()
             .size_full()
             .justify_center()
             .gap(px(10.))
             .child(h_flex().items_center().gap(px(14.)).child(self.mark(p, 72.)).child(wordmark(p, 30.)))
-            .child(label(s.login_hint, p).mb(px(10.)))
-            .child(field(&self.email, p))
-            .child(field(&self.password, p))
-            .when(self.need_totp, |el| el.child(field(&self.login_code, p)))
-            .child(
-                button("login", s.sign_in, Kind::Solid, false, cx)
-                    .w_full()
-                    .on_click(cx.listener(|this, _, window, cx| this.login(window, cx))),
-            )
+            .child(label(s.login_hint, p))
+            .child(label(s.sign_in_hint, p).mb(px(10.)))
+            .child(if waiting {
+                v_flex()
+                    .gap(px(10.))
+                    .child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child(s.waiting_browser))
+                    .child(button("cancel-sign-in", s.cancel, Kind::Default, false, cx).w_full().on_click(cx.listener(|this, _, _, cx| this.cancel_sign_in(cx))))
+            } else {
+                v_flex().child(button("login", s.sign_in, Kind::Solid, false, cx).w_full().on_click(cx.listener(|this, _, _, cx| this.sign_in(cx))))
+            })
             .children(self.note(p))
     }
 
@@ -697,6 +793,15 @@ impl Shell {
                     )
                     .child(two_factor)
                     .child(
+                        block(s.passkeys, "", p).child(
+                            v_flex().gap(px(10.)).child(label(s.passkeys_hint, p)).child(
+                                button("passkeys", s.manage_in_browser, Kind::Default, false, cx)
+                                    .w_full()
+                                    .on_click(|_, _, _| update::open_external(format!("{}/account", api::base()))),
+                            ),
+                        ),
+                    )
+                    .child(
                         block(s.password, "", p).child(
                             v_flex().gap(px(10.)).child(field(&self.current_password, p)).child(field(&self.new_password, p)).child(
                                 button("password", s.change_password, Kind::Default, false, cx).w_full().on_click(cx.listener(|this, _, window, cx| {
@@ -732,6 +837,10 @@ impl Shell {
 
 impl Render for Shell {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let state = self.tray_state();
+        if let Some(tray) = self.tray.as_mut() {
+            tray.show(&state, self.lang.strings());
+        }
         let p = palette(cx.theme().is_dark());
         let body = match self.screen {
             Screen::Login => self.login_screen(p, cx),
@@ -752,6 +861,11 @@ impl Render for Shell {
 }
 
 // ------------------------------------------------------------------ traffic
+
+fn new_tunnel_id() -> String {
+    format!("t-{:016x}{:016x}", rand::random::<u64>(), rand::random::<u64>())
+}
+
 
 /// What the graph covers, in ticks of one second.
 const WINDOW: usize = 60;
@@ -987,6 +1101,8 @@ fn pair(name: &'static str, value: String, p: Palette) -> Div {
     v_flex().child(label(name, p)).child(div().text_size(px(20.)).line_height(relative(1.3)).font_weight(FontWeight::SEMIBOLD).child(value))
 }
 
+actions!(bkn_proxy, [Quit]);
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if let [_, mode, port, token_file] = args.as_slice()
@@ -1011,17 +1127,28 @@ fn main() {
     let saved_token = keychain().and_then(|k| k.get_password().ok());
     tracing::info!(saved_session = saved_token.is_some(), "keychain read");
     let lang = Lang::load();
-    gpui_kit::application().run(move |cx| {
+    let application = gpui_kit::application();
+    // macOS: a click on the Dock icon brings the hidden window back.
+    application.on_reopen(|cx| cx.activate(true));
+    application.run(move |cx| {
         gpui_kit::init(cx);
-        // Quitting closes the helper connection, which tears the tunnel down.
-        cx.on_window_closed(|cx, _| cx.quit()).detach();
+        // Closing the window leaves the app running in the tray (see Shell::new).
+        // Quit is in the tray menu, or Cmd+Q on macOS; quitting closes the
+        // helper's connection, which tears the tunnel down.
+        cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+        cx.set_menus([Menu { name: "bkn-proxy".into(), items: vec![MenuItem::action("Quit bkn-proxy", Quit)], disabled: false }]);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(420.), px(640.)), cx))),
-            window_min_size: Some(size(px(420.), px(480.))),
+            // A fixed size: the screens are laid out for this column; long content scrolls.
+            is_resizable: false,
             titlebar: Some(TitlebarOptions { title: Some("bkn-proxy".into()), ..Default::default() }),
             ..Default::default()
         };
-        gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| Shell::new(saved_token, lang, window, cx))).expect("failed to open window");
+        let (_, shell) =
+            gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| Shell::new(saved_token, lang, window, cx))).expect("failed to open window");
+        // The tray icon is made here, on the main thread, which macOS requires.
+        shell.update(cx, |shell, _| shell.tray = tray::Tray::new(&shell.tray_state(), shell.lang.strings()));
         cx.activate(true);
     });
 }
@@ -1153,14 +1280,14 @@ mod tests {
             };
             shot("1-login", &|shell| {
                 shell.screen = Screen::Login;
-                shell.need_totp = false;
+                shell.signing_in = None;
                 shell.note = "".into();
             });
-            shot("2-login-error", &|shell| {
-                shell.need_totp = true;
-                shell.note = lang.strings().invalid_totp.into();
+            shot("2-login-waiting", &|shell| {
+                shell.signing_in = Some(super::RT.spawn(std::future::pending::<()>()).abort_handle());
             });
             shot("3-off", &|shell| {
+                shell.signing_in = None;
                 shell.screen = Screen::Proxies;
                 shell.note = "".into();
                 shell.active = None;

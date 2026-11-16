@@ -12,8 +12,8 @@ static HTTP: LazyLock<Client> = LazyLock::new(Client::new);
 /// The server's address, e.g. https://example.com. Runtime env wins, then the
 /// value baked in at build time, then local dev. It is never written in the
 /// source: release builds get it from the build environment.
-fn base() -> String {
-    std::env::var("BKN_API_URL").unwrap_or_else(|_| option_env!("BKN_API_URL").unwrap_or("http://127.0.0.1:8080").into())
+pub fn base() -> String {
+    std::env::var("BKN_API_URL").unwrap_or_else(|_| option_env!("BKN_API_URL").unwrap_or("http://localhost:8080").into())
 }
 
 /// The version of the server's API this app speaks.

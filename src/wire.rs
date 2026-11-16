@@ -1,14 +1,5 @@
 //! The JSON the server's API (v1) sends and expects, as far as this app uses it.
-use serde::{Deserialize, Serialize};
-
-#[derive(Serialize, Deserialize)]
-pub struct LoginRequest {
-    pub email: String,
-    pub password: String,
-    /// 6-digit code; required only when the account has 2FA enabled.
-    pub totp: Option<String>,
-    pub device: Option<String>,
-}
+use serde::Deserialize;
 
 #[derive(Deserialize)]
 pub struct LoginResponse {

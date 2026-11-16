@@ -9,25 +9,34 @@ Built with Rust, [GPUI](https://www.gpui.rs) and
 
 ## What it does
 
-- Signs in to a bkn-proxy server with email, password and optional 2FA.
+- Signs in through the browser: the server's sign-in page handles password,
+  2FA code and passkeys, then hands the app a one-time code on 127.0.0.1
+  (OAuth's native-app flow with PKCE). See `src/signin.rs`.
+- Lives in the menu bar (macOS) or notification area (Windows, Linux): the
+  icon shows whether the tunnel is on and switches connections. Closing the
+  window keeps the app and the tunnel running; quit from the icon's menu.
 - Lists the proxies the admin granted. Changes on the server (a proxy granted,
   revoked or edited) reach the app at once; a revoked proxy drops the tunnel.
 - Lets you give a connection your own name. Only you see it, and it follows
   your account to your other devices.
 - Routes the whole device, not just one program, and shows speed, totals and
   a graph of the last minute while connected.
-- English and Russian, light and dark.
+- Reports to the server, every five seconds while connected, which proxy it
+  uses and how many bytes went through: no addresses, no DNS names. The
+  server's backoffice shows who is online and the traffic.
+- English and Russian, light and dark; a fixed-size window.
 - Checks for a newer version, downloads and verifies it, and offers to install.
 
 ## Run from source
 
 ```bash
-BKN_API_URL=http://127.0.0.1:8080 cargo run
+BKN_API_URL=http://localhost:8080 cargo run
 ```
 
 `BKN_API_URL` is the server's address. It is read at build time and again at
 run time, and is never written in this repository. Without it the app talks
-to `http://127.0.0.1:8080`.
+to `http://localhost:8080` (a host name, not an IP: the sign-in page's
+passkeys need one).
 
 ## Checks
 
@@ -86,4 +95,7 @@ no cards, borders or shadows.
 
 The wordmark is set in JetBrains Mono (SIL Open Font License, see
 `assets/JetBrainsMono-LICENSE.txt`). `assets/make-icons.py` regenerates the
-icon files from `assets/icon.svg`.
+icon files from `assets/icon.svg`, `assets/make-tray-icons.py` the tray icons.
+
+Linux needs GTK and libayatana-appindicator for the tray icon (on Debian and
+Ubuntu: `libgtk-3-dev libayatana-appindicator3-dev`).
