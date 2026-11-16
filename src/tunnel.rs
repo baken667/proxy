@@ -216,10 +216,26 @@ async fn run_tunnel(url: String, token: CancellationToken, states: mpsc::Unbound
     }
     let device = tun::create_as_async(&config).context("can't create the tunnel device")?;
     let name = tun::AbstractDevice::tun_name(&*device)?;
-    let network = tokio::task::spawn_blocking(move || crate::net::Network::apply(&name, proxy.ip())).await??;
+    let network = tokio::task::spawn_blocking({
+        let name = name.clone();
+        move || crate::net::Network::apply(&name, proxy.ip())
+    })
+    .await??;
     let _ = states.send("up".into());
 
+    // The network under the tunnel may change while it is up: another Wi-Fi,
+    // a wake from sleep. The proxy's own route has to follow (net::follow).
+    let follow = tokio::spawn(async move {
+        let mut every = tokio::time::interval(Duration::from_secs(3));
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            every.tick().await;
+            let name = name.clone();
+            let _ = tokio::task::spawn_blocking(move || crate::net::follow(&name, proxy.ip())).await;
+        }
+    });
     let result = tun2proxy::run(device, tun2proxy::DEFAULT_MTU, args, token).await;
+    follow.abort();
     // Undo the routes and DNS (blocking commands) before reporting anything.
     tokio::task::spawn_blocking(move || drop(network)).await?;
     result?;

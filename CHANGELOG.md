@@ -4,6 +4,15 @@ What changed in each release of the bkn-proxy desktop app. The section for a
 version becomes the notes of its GitHub release, where a line break inside a
 paragraph shows as one: keep each entry on a single line.
 
+## 0.4.0 — 2026-11-17
+
+- The connection comes back by itself. A tunnel that goes down is reconnected: after 1, 2, 4, 8 and 16 seconds, then every 30, until it is up or you press Disconnect. A system notification says that traffic goes out directly meanwhile. Reconnect is a switch in Settings and is on.
+- Another Wi-Fi network, a cable or a wake from sleep no longer leaves the device without internet until a reconnect: within a few seconds the tunnel moves to the new network. macOS and Windows. The first connect after this update asks for the administrator password once more on macOS, as the tunnel helper changed.
+- Open at login: a switch in Settings. The app starts in the background, in the menu bar or notification area, with no window. Off until you turn it on.
+- Connect at launch: a switch in Settings. Starting the app connects to the connection used last. Off until you turn it on; on Windows it brings the administrator prompt at start.
+- Setting up two-factor authentication shows a QR code to scan with the authenticator app. The key and the setup link can still be copied.
+- Fixed: the line saying that a proxy was taken away by the admin disappeared as soon as it was shown.
+
 ## 0.3.1 — 2026-11-17
 
 - Fixed: on macOS 0.3.0 could not connect at all. It asked for the administrator password and then said "The tunnel helper did not start": macOS refuses to run a signed app's executable outside its app, and that is how the helper was installed. The helper is now a copy of the whole app. The first connect after this update asks for the password once more.

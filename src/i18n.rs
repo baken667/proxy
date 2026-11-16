@@ -102,6 +102,11 @@ pub struct Strings {
     /// Bytes, then each next thousand.
     pub units: [&'static str; 5],
     pub disconnect: &'static str,
+    /// A tunnel that went down by itself and is being brought back; `{}` is why it went.
+    pub retrying: &'static str,
+    /// The system notification about it: a title, and what it means meanwhile.
+    pub connection_lost: &'static str,
+    pub lost_reconnecting: &'static str,
     pub proxies: &'static str,
     pub none_yet: &'static str,
     pub connect: &'static str,
@@ -127,6 +132,14 @@ pub struct Strings {
     // Settings
     pub back: &'static str,
     pub account: &'static str,
+    /// Switches: a name and a line saying what on means.
+    pub connection: &'static str,
+    pub reconnect: &'static str,
+    pub reconnect_hint: &'static str,
+    pub connect_at_start: &'static str,
+    pub connect_at_start_hint: &'static str,
+    pub autostart: &'static str,
+    pub autostart_hint: &'static str,
     pub security: &'static str,
     pub app: &'static str,
     pub sign_out: &'static str,
@@ -234,6 +247,9 @@ const EN: Strings = Strings {
     per_second: "{}/s",
     units: ["B", "KB", "MB", "GB", "TB"],
     disconnect: "Disconnect",
+    retrying: "{} · trying again",
+    connection_lost: "Connection lost",
+    lost_reconnecting: "Traffic goes out directly until the connection is back.",
     proxies: "Proxies",
     none_yet: "None yet. Ask your admin for access.",
     connect: "Connect",
@@ -255,6 +271,13 @@ const EN: Strings = Strings {
 
     back: "Back",
     account: "Account",
+    connection: "Connection",
+    reconnect: "Reconnect",
+    reconnect_hint: "Brings the tunnel back when it drops.",
+    connect_at_start: "Connect at launch",
+    connect_at_start_hint: "To the connection used last.",
+    autostart: "Open at login",
+    autostart_hint: "In the background, without a window.",
     security: "Sign-in",
     app: "App",
     sign_out: "Sign out",
@@ -263,7 +286,7 @@ const EN: Strings = Strings {
     two_factor_off: "Off",
     turn_off_hint: "Enter a code from your authenticator app to turn it off.",
     turn_off: "Turn off",
-    set_up_hint: "Add this key to your authenticator app, then enter the code it shows.",
+    set_up_hint: "Scan the code with your authenticator app, or add the key by hand. Then enter the code the app shows.",
     copy_key: "Key",
     copy_link: "Setup link",
     copied: "Copied",
@@ -336,6 +359,9 @@ const RU: Strings = Strings {
     per_second: "{}/с",
     units: ["Б", "КБ", "МБ", "ГБ", "ТБ"],
     disconnect: "Отключить",
+    retrying: "{} · пробую снова",
+    connection_lost: "Соединение потеряно",
+    lost_reconnecting: "Пока соединение не вернётся, трафик идёт напрямую.",
     proxies: "Прокси",
     none_yet: "Пока пусто. Попросите администратора выдать доступ.",
     connect: "Подключить",
@@ -357,6 +383,13 @@ const RU: Strings = Strings {
 
     back: "Назад",
     account: "Аккаунт",
+    connection: "Подключение",
+    reconnect: "Переподключение",
+    reconnect_hint: "Возвращает туннель после обрыва.",
+    connect_at_start: "Подключаться при запуске",
+    connect_at_start_hint: "К последнему подключению.",
+    autostart: "Запуск при входе в систему",
+    autostart_hint: "В фоне, без окна.",
     security: "Вход",
     app: "Приложение",
     sign_out: "Выйти",
@@ -365,7 +398,7 @@ const RU: Strings = Strings {
     two_factor_off: "Выкл.",
     turn_off_hint: "Чтобы выключить, введите код из приложения-аутентификатора.",
     turn_off: "Выключить",
-    set_up_hint: "Добавьте этот ключ в приложение-аутентификатор и введите код, который оно покажет.",
+    set_up_hint: "Отсканируйте код приложением-аутентификатором или добавьте ключ вручную. Затем введите код, который оно покажет.",
     copy_key: "Ключ",
     copy_link: "Ссылка",
     copied: "Скопировано",
@@ -421,7 +454,7 @@ mod tests {
         // template kept its placeholder.
         for lang in Lang::ALL {
             let s = lang.strings();
-            for template in [s.for_time, s.in_total, s.peak, s.per_second, s.session_not_saved, s.update_ready, s.version_available, s.downloading, s.installing, s.installed] {
+            for template in [s.retrying, s.for_time, s.in_total, s.peak, s.per_second, s.session_not_saved, s.update_ready, s.version_available, s.downloading, s.installing, s.installed] {
                 assert!(template.contains("{}"), "{lang:?}: {template:?} lost its {{}}");
             }
             assert_eq!(Lang::from_code(lang.code()), Some(lang));

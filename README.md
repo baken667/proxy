@@ -23,6 +23,15 @@ Built with Rust, [GPUI](https://www.gpui.rs) and
   your account to your other devices.
 - Routes the whole device, not just one program, and shows speed, totals and
   a graph of the last minute while connected.
+- Keeps the connection by itself. A tunnel that goes down is brought back
+  (after 1, 2, 4, 8 and 16 seconds, then every 30) until it is up or you
+  disconnect, and a system notification says that traffic goes out directly
+  meanwhile. Another Wi-Fi network or a wake from sleep does not need a
+  reconnect at all: the tunnel moves to the new network within a few seconds.
+- Three switches in Settings: Reconnect (on by default), Connect at launch
+  (to the connection used last) and Open at login (in the background, with
+  no window). The last two are off until you turn them on.
+- Two-factor setup shows the key as a QR code for the authenticator app.
 - Reports to the server, every five seconds while connected, which proxy it
   uses and how many bytes went through: no addresses, no DNS names. The
   server's backoffice shows who is online and the traffic.
@@ -102,8 +111,24 @@ Versions 0.1.0 and 0.2.0 could leave DNS pointed at 10.0.0.1 or the default
 route changed after a crash. The app checks for that at start and offers
 Repair network (also in Settings), and every connect repairs it first.
 
+The host route that keeps the proxy server itself out of the tunnel goes
+through the gateway of the network the device is on. While a tunnel is up the
+helper reads the routing table every three seconds and moves that route when
+the gateway is no longer there, or puts it back when it went away with the
+old address (`follow` in `src/net.rs`).
+
 Linux still uses tun2proxy's own setup, which does not undo itself if the
-helper is killed.
+helper is killed and does not follow a change of network.
+
+## Settings on disk
+
+The switches are kept in `prefs.json` next to the saved language, in the
+system's configuration folder (`~/Library/Application Support/bkn-proxy` on
+macOS). Open at login is not in that file: it is an entry the system reads by
+itself, which starts the app with `--background`. On macOS that is
+`~/Library/LaunchAgents/kz.bkn.proxy.plist`, on Windows a value under the
+user's `Run` key, on Linux `~/.config/autostart/kz.bkn.proxy.desktop`. The
+app rewrites the entry at every start, so it follows the app when it is moved.
 
 Windows needs `wintun.dll` next to the executable; the release build ships it.
 

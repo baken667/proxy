@@ -2,6 +2,7 @@
 mod api;
 mod i18n;
 mod net;
+mod prefs;
 mod signin;
 mod tray;
 mod tunnel;
@@ -23,12 +24,14 @@ use gpui_kit::{
         chart::AreaChart,
         h_flex,
         input::{Input, InputEvent, InputState},
+        switch::Switch,
         v_flex,
     },
     prelude::FluentBuilder,
     *,
 };
 use i18n::{Lang, Strings, fill};
+use prefs::{Prefs, autostart};
 use reqwest::Method;
 use serde_json::{Value, json};
 use wire::*;
@@ -117,6 +120,16 @@ struct Shell {
     /// The browser sign-in in progress; dropping it does not stop it, aborting does.
     signing_in: Option<tokio::task::AbortHandle>,
     totp_setup: Option<TotpSetup>,
+    /// The setup link as a QR code, for the authenticator app's camera.
+    totp_qr: Option<Arc<Image>>,
+    prefs: Prefs,
+    /// The system starts the app at login (the system's own record of it).
+    autostart: bool,
+    /// Connect to the connection used last, once the server has confirmed the session.
+    autoconnect: bool,
+    /// Attempts at bringing a dropped tunnel back since it was last up, and the wait before the next.
+    retries: u32,
+    _retry: Option<Task<()>>,
     open: Option<Panel>,
     tunnel: Option<Tunnel>,
     launching: bool,
@@ -148,7 +161,7 @@ struct Shell {
 }
 
 impl Shell {
-    fn new(saved_token: Option<String>, lang: Lang, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(saved_token: Option<String>, lang: Lang, prefs: Prefs, window: &mut Window, cx: &mut Context<Self>) -> Self {
         apply_theme(window, cx);
         // The wordmark's typeface; everything else is the system font.
         let _ = cx.text_system().add_fonts(vec![Cow::Borrowed(FONT)]);
@@ -206,7 +219,8 @@ impl Shell {
             });
         });
 
-        // The helper reports `up` / `down [reason]`; the UI just mirrors it.
+        // The helper reports `up` / `down [reason]`; the UI mirrors it, and
+        // brings back a tunnel that went down by itself (`tunnel_down`).
         let (tunnel_states, mut states) = mpsc::unbounded_channel::<String>();
         cx.spawn(async move |this, cx| {
             while let Some(state) = states.recv().await {
@@ -228,15 +242,12 @@ impl Shell {
                         this.traffic = Some(Traffic::new());
                         this.tunnel_id = Some(new_tunnel_id());
                         this.report(true);
+                        // Whatever was said about a tunnel that would not come up is over.
+                        this.note = "".into();
+                        this.retries = 0;
+                        this._retry = None;
                     } else {
-                        this.traffic = None;
-                        this.tunnel_id = None;
-                        this.report(true);
-                        tracing::warn!("tunnel {state}");
-                        this.active = None;
-                        this.link = Link::Off;
-                        let reason = state.trim_start_matches("down").trim();
-                        this.note = this.lang.strings().message(reason).to_string().into();
+                        this.tunnel_down(state.trim_start_matches("down").trim(), cx);
                     }
                     cx.notify();
                 });
@@ -245,17 +256,9 @@ impl Shell {
         .detach();
 
         // Closing the window keeps the app (and the tunnel) running: the
-        // tray icon brings it back. macOS hides the app and takes it out of
-        // the Dock and the Cmd+Tab list (`foreground` puts it back); elsewhere
-        // the window is minimized, as there is no hidden window state to
-        // return from.
+        // tray icon brings it back.
         window.on_window_should_close(cx, |window, cx| {
-            if cfg!(target_os = "macos") {
-                cx.hide();
-                cx.set_activation_policy(ActivationPolicy::Accessory);
-            } else {
-                window.minimize_window();
-            }
+            to_tray(window, cx);
             false
         });
         let mut tray_clicks = tray::listen();
@@ -297,6 +300,13 @@ impl Shell {
             info: "".into(),
             signing_in: None,
             totp_setup: None,
+            totp_qr: None,
+            // Only for a session that was there at start: signing in is not starting the app.
+            autoconnect: prefs.connect_at_start && saved_token.is_some(),
+            prefs,
+            autostart: autostart::enabled(),
+            retries: 0,
+            _retry: None,
             open: None,
             tunnel: None,
             launching: false,
@@ -449,7 +459,12 @@ impl Shell {
                             if this.me.is_none() {
                                 this.note = "".into(); // whatever kept the session from being confirmed is over
                             }
-                            this.apply(me, proxies)
+                            this.apply(me, proxies);
+                            if std::mem::take(&mut this.autoconnect)
+                                && let Some(id) = this.last_proxy()
+                            {
+                                this.connect(id, cx);
+                            }
                         }
                         Ok(Err(error)) => this.fail(error, cx),
                         Err(_) => {}
@@ -553,11 +568,78 @@ impl Shell {
         self.active = Some(id);
         self.link = Link::Connecting;
         self.note = "".into();
+        let last = Some((api::base(), id));
+        if self.prefs.last != last {
+            self.prefs.last = last;
+            self.prefs.save();
+        }
         if let Some(tunnel) = self.tunnel.as_ref().filter(|t| t.alive()) {
             tunnel.connect(&url); // helper already running: instant switch
             return;
         }
         self.ensure_helper(cx);
+    }
+
+    /// The connection used last, if this server still grants it.
+    fn last_proxy(&self) -> Option<i64> {
+        let (server, id) = self.prefs.last.as_ref()?;
+        (*server == api::base() && self.proxies.iter().any(|proxy| proxy.id == *id)).then_some(*id)
+    }
+
+    /// The helper said `down`. With a reason the tunnel went by itself: the
+    /// proxy's name no longer resolves, the device is offline, the tunnel
+    /// crashed. With Reconnect on it is brought back, after 1, 2, 4, 8 and 16
+    /// seconds and then every 30, until it is up, the user disconnects or the
+    /// proxy is taken away. A helper that can't be started ends it as well
+    /// (`ensure_helper`), so a declined password prompt is not asked again.
+    fn tunnel_down(&mut self, reason: &str, cx: &mut Context<Self>) {
+        // No reason: the answer to our own `disconnect`, which has already put
+        // everything right. A connect may have followed it; leave that alone.
+        if reason.is_empty() {
+            return;
+        }
+        tracing::warn!("tunnel down: {reason}");
+        let was_on = self.link == Link::On;
+        self.traffic = None;
+        self.tunnel_id = None;
+        self.report(true);
+        let Some(id) = self.active else {
+            self.link = Link::Off;
+            return;
+        };
+        let s = self.lang.strings();
+        let reason = s.message(reason).to_string();
+        if was_on {
+            // Said once, with the window closed too: until the tunnel is back
+            // the device's traffic is not in it.
+            cx.show_system_notification(SystemNotification {
+                tag: "tunnel".into(),
+                title: s.connection_lost.into(),
+                body: if self.prefs.reconnect { s.lost_reconnecting } else { s.direct }.into(),
+                actions: vec![],
+            });
+        }
+        if !self.prefs.reconnect {
+            self.active = None;
+            self.link = Link::Off;
+            self.note = reason.into();
+            return;
+        }
+        self.link = Link::Connecting;
+        self.note = fill(s.retrying, &reason).into();
+        let wait = retry_delay(self.retries);
+        self.retries += 1;
+        self._retry = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            let _ = this.update(cx, |this, cx| {
+                // Still wanted, and nobody has connected or disconnected in the meantime.
+                if this.active == Some(id) && this.link == Link::Connecting {
+                    this.connect(id, cx);
+                    this.note = fill(s.retrying, &reason).into(); // `connect` cleared it; it still holds
+                }
+                cx.notify();
+            });
+        }));
     }
 
     /// Undoes network settings an older version left behind. Needs the
@@ -602,6 +684,7 @@ impl Shell {
                     failed => {
                         this.active = None;
                         this.link = Link::Off;
+                        this.retries = 0;
                         this.pending_repair = false;
                         this.repairing = false;
                         this.note = match failed {
@@ -627,6 +710,8 @@ impl Shell {
         self.active = None;
         self.link = Link::Off;
         self.traffic = None;
+        self.retries = 0;
+        self._retry = None;
         if self.tunnel_id.take().is_some() {
             self.report(true);
         }
@@ -1057,6 +1142,8 @@ impl Shell {
             let panel = v_flex()
                 .gap(px(8.))
                 .child(label(s.set_up_hint, p))
+                // Black on white in both themes: that is what a camera reads.
+                .children(self.totp_qr.clone().map(|qr| img(qr).size(px(168.)).rounded(px(8.))))
                 .child(div().font_family("Menlo").text_size(px(SMALL)).child(secret.clone()))
                 .child(h_flex().gap(px(8.)).child(copy("copy-key", s.copy_key, secret, cx)).child(copy("copy-url", s.copy_link, url, cx)))
                 .child(field(&self.totp_code, p))
@@ -1069,7 +1156,7 @@ impl Shell {
         } else {
             setting(IconName::ShieldCheck, s.two_factor, s.two_factor_off, p).child(
                 button("totp-setup", s.set_up, Kind::Default, true, cx).on_click(cx.listener(|this, _, window, cx| {
-                    this.call(Method::POST, "/me/totp/setup", None, window, cx, |this, setup: TotpSetup, _, _| this.totp_setup = Some(setup));
+                    this.call(Method::POST, "/me/totp/setup", None, window, cx, |this, setup: TotpSetup, _, _| this.totp_started(setup));
                 })),
             )
         };
@@ -1089,6 +1176,46 @@ impl Shell {
                 )
             }),
         );
+
+        // A switch at the end of a row; `set` takes what the user asked for.
+        let switch = |id: &'static str, on: bool, name: &'static str, set: fn(&mut Self, bool), cx: &mut Context<Self>| {
+            Switch::new(id).checked(on).color(p.ink).accessibility_label(name).on_click(cx.listener(move |this, on: &bool, _, cx| {
+                this.note = "".into();
+                this.info = "".into();
+                set(this, *on);
+                cx.notify();
+            }))
+        };
+        let reconnect = setting(IconName::RefreshCw, s.reconnect, s.reconnect_hint, p).child(switch(
+            "reconnect",
+            self.prefs.reconnect,
+            s.reconnect,
+            |this, on| {
+                this.prefs.reconnect = on;
+                this.prefs.save();
+            },
+            cx,
+        ));
+        let connect_at_start = setting(IconName::PlugZap, s.connect_at_start, s.connect_at_start_hint, p).child(switch(
+            "connect-at-start",
+            self.prefs.connect_at_start,
+            s.connect_at_start,
+            |this, on| {
+                this.prefs.connect_at_start = on;
+                this.prefs.save();
+            },
+            cx,
+        ));
+        let at_login = setting(IconName::Rocket, s.autostart, s.autostart_hint, p).child(switch(
+            "autostart",
+            self.autostart,
+            s.autostart,
+            |this, on| match autostart::set(on) {
+                Ok(()) => this.autostart = on,
+                Err(error) => this.note = error.to_string().into(),
+            },
+            cx,
+        ));
 
         // The step the update is at, else what the last check said, else the version.
         let status = self.update_status().map(SharedString::from).unwrap_or_else(|| match self.update_note.is_empty() {
@@ -1132,6 +1259,7 @@ impl Shell {
                             ),
                         ),
                     )
+                    .child(group(s.connection, "", p).child(reconnect).child(connect_at_start))
                     .child(
                         group(s.security, "", p).child(two_factor).child(password).child(
                             setting(IconName::KeyRound, s.passkeys, s.passkeys_hint, p).child(
@@ -1154,6 +1282,7 @@ impl Shell {
                                     this.set_lang(lang, window, cx);
                                 }))
                             }))))
+                            .child(at_login)
                             .child(
                                 setting(IconName::Wrench, s.network, s.network_hint, p).child(
                                     button("repair", if self.repairing { s.repairing } else { s.repair_network }, Kind::Default, true, cx)
@@ -1163,6 +1292,14 @@ impl Shell {
                             .child(updates),
                     ),
             )
+    }
+
+    /// The server made a key: show it, as text and as a QR code of the setup link.
+    fn totp_started(&mut self, setup: TotpSetup) {
+        // The crate's own SVG: black modules on white with the quiet zone a scanner needs.
+        let svg = qrcode::QrCode::new(&setup.otpauth_url).map(|code| code.render::<qrcode::render::svg::Color>().min_dimensions(504, 504).build());
+        self.totp_qr = svg.ok().map(|svg| Arc::new(Image::from_bytes(ImageFormat::Svg, svg.into_bytes())));
+        self.totp_setup = Some(setup);
     }
 
     fn totp_switch(&mut self, action: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -1223,6 +1360,12 @@ fn new_tunnel_id() -> String {
     format!("t-{:016x}{:016x}", rand::random::<u64>(), rand::random::<u64>())
 }
 
+
+/// The wait before attempt number `retries` (from 0) at bringing a dropped
+/// tunnel back: 1, 2, 4, 8, 16 seconds, then 30 for as long as it takes.
+fn retry_delay(retries: u32) -> Duration {
+    Duration::from_secs((1 << retries.min(5)).min(30))
+}
 
 /// What the graph covers, in ticks of one second.
 const WINDOW: usize = 60;
@@ -1383,7 +1526,29 @@ fn apply_palette(cx: &mut App) {
 // here are built into the app.
 gpui_kit::assets::icon_assets!(
     Icons,
-    [ArrowLeft, Check, CircleAlert, CircleCheck, Copy, Download, ExternalLink, KeyRound, Languages, Lock, LogOut, Pencil, Power, Settings, ShieldCheck, TriangleAlert, User, Wrench]
+    [
+        ArrowLeft,
+        Check,
+        CircleAlert,
+        CircleCheck,
+        Copy,
+        Download,
+        ExternalLink,
+        KeyRound,
+        Languages,
+        Lock,
+        LogOut,
+        Pencil,
+        PlugZap,
+        Power,
+        RefreshCw,
+        Rocket,
+        Settings,
+        ShieldCheck,
+        TriangleAlert,
+        User,
+        Wrench
+    ]
 );
 
 fn icon(name: IconName, size: f32, color: Hsla) -> Icon {
@@ -1583,6 +1748,19 @@ fn foreground(cx: &mut App) {
     cx.activate(true);
 }
 
+/// Out of sight and still running, with the tray icon as the way back. macOS
+/// hides the app and takes it out of the Dock and the Cmd+Tab list
+/// (`foreground` puts it back); elsewhere the window is minimized, as there
+/// is no hidden window state to return from.
+fn to_tray(window: &mut Window, cx: &mut App) {
+    if cfg!(target_os = "macos") {
+        cx.hide();
+        cx.set_activation_policy(ActivationPolicy::Accessory);
+    } else {
+        window.minimize_window();
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).is_some_and(|mode| mode == "helper") {
@@ -1605,10 +1783,22 @@ fn main() {
     tracing::info!("starting, reading the saved session from the keychain");
     let saved_token = keychain().and_then(|k| k.get_password().ok());
     tracing::info!(saved_session = saved_token.is_some(), "keychain read");
-    let lang = Lang::load();
+    let (lang, prefs) = (Lang::load(), Prefs::load());
+    // Started by the system at login: stay in the tray.
+    let background = args.iter().any(|arg| arg == autostart::FLAG);
+    // The login entry names the app's place; the app may have been moved since.
+    if autostart::enabled() {
+        let _ = autostart::set(true);
+    }
     let application = gpui_kit::application().with_assets(Icons);
-    // macOS: opening the app again while it runs in the background brings the window back.
-    application.on_reopen(foreground);
+    // macOS: opening the app again while it runs in the background brings the
+    // window back, also one that a start at login never showed.
+    application.on_reopen(|cx| {
+        foreground(cx);
+        for window in cx.windows() {
+            let _ = window.update(cx, |_, window, _| window.activate_window());
+        }
+    });
     application.run(move |cx| {
         gpui_kit::init(cx);
         // Windows shows notifications only for an app that has named itself.
@@ -1619,25 +1809,37 @@ fn main() {
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         cx.set_menus([Menu { name: "bkn-proxy".into(), items: vec![MenuItem::action("Quit bkn-proxy", Quit)], disabled: false }]);
+        // Started at login on macOS: the window is made and not shown, and the
+        // app stays out of the Dock, as after closing the window. Elsewhere a
+        // window that was never shown has no way back, so it is minimized.
+        let unseen = background && cfg!(target_os = "macos");
         let options = WindowOptions {
+            show: !unseen,
+            focus: !unseen,
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(420.), px(640.)), cx))),
             // A fixed size: the screens are laid out for this column; long content scrolls.
             is_resizable: false,
             titlebar: Some(TitlebarOptions { title: Some("bkn-proxy".into()), ..Default::default() }),
             ..Default::default()
         };
-        let (_, shell) =
-            gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| Shell::new(saved_token, lang, window, cx))).expect("failed to open window");
+        let (window, shell) =
+            gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| Shell::new(saved_token, lang, prefs, window, cx))).expect("failed to open window");
         // The tray icon is made here, on the main thread, which macOS requires.
         shell.update(cx, |shell, _| shell.tray = tray::Tray::new(&shell.tray_state(), shell.lang.strings()));
-        cx.activate(true);
+        if unseen {
+            cx.set_activation_policy(ActivationPolicy::Accessory);
+        } else if background {
+            let _ = window.update(cx, |_, window, _| window.minimize_window());
+        } else {
+            cx.activate(true);
+        }
     });
 }
 
 #[cfg(test)]
 mod tests {
     // No `use super::*`: the gpui_kit glob would shadow Rust's #[test].
-    use super::{Lang, Link, Screen, Shell, Traffic, Update, WINDOW, apply_palette, bytes, clock};
+    use super::{Lang, Link, Screen, Shell, Traffic, Update, WINDOW, apply_palette, bytes, clock, retry_delay};
     use gpui_kit::{
         AppContext, Bounds, HeadlessAppContext, TestAppContext, WindowBounds, WindowOptions,
         component::{Theme, ThemeMode},
@@ -1652,7 +1854,7 @@ mod tests {
     fn screens_and_revocation(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let (window, shell) = cx.update(|cx| {
-            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| cx.new(|cx| Shell::new(None, Lang::En, window, cx))).unwrap()
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| cx.new(|cx| Shell::new(None, Lang::En, crate::prefs::Prefs::default(), window, cx))).unwrap()
         });
         let me = || Me { email: "a@b.c".into(), totp_enabled: false };
         let proxy = |id| Proxy { id, name: format!("p{id}"), url: format!("socks5://u:secret@10.0.0.{id}:1080") };
@@ -1719,6 +1921,14 @@ mod tests {
             window.render_frame(cx);
             assert!(window.try_find("restart").is_none() && window.try_find("check-updates").is_some());
 
+            // The switches are the preferences, with Reconnect on from the start.
+            assert!(shell.read(cx).prefs.reconnect && !shell.read(cx).prefs.connect_at_start);
+            window.click("reconnect", cx);
+            window.click("connect-at-start", cx);
+            assert!(!shell.read(cx).prefs.reconnect && shell.read(cx).prefs.connect_at_start);
+            window.click("reconnect", cx);
+            assert!(window.try_find("autostart").is_some());
+
             // The password fields open under their row and close again.
             assert!(window.try_find("password-save").is_none());
             window.click("password", cx);
@@ -1735,6 +1945,27 @@ mod tests {
                 shell.apply(me(), vec![proxy(2)]); // admin revoked proxy 1
                 assert_eq!(shell.active, None);
                 assert!(shell.link == Link::Off);
+            });
+
+            // A tunnel that goes down by itself is brought back while Reconnect
+            // is on, and is simply off without it.
+            shell.update(cx, |shell, cx| {
+                shell.active = Some(2);
+                shell.link = Link::On;
+                shell.tunnel_down("", cx); // the helper's answer to a disconnect of ours
+                assert!(shell.link == Link::On);
+                shell.tunnel_down("no default route", cx);
+                assert!(shell.active == Some(2) && shell.link == Link::Connecting && shell.retries == 1);
+                assert!(shell.note.contains("no default route"));
+                shell.disconnect(); // the user gave up: the waiting attempt goes too
+                assert!(shell.active.is_none() && shell.retries == 0 && shell._retry.is_none());
+
+                shell.prefs.reconnect = false;
+                shell.active = Some(2);
+                shell.link = Link::On;
+                shell.tunnel_down("no default route", cx);
+                assert!(shell.active.is_none() && shell.link == Link::Off && shell._retry.is_none());
+                assert_eq!(shell.note.as_ref(), "no default route");
             });
         })
         .unwrap();
@@ -1761,6 +1992,7 @@ mod tests {
         assert_eq!(bytes(12_400_000, en), "12 MB");
         assert_eq!(bytes(3_200_000_000, ru), "3.2 ГБ");
         assert_eq!((clock(5), clock(75), clock(3_675)), ("0:05".into(), "1:15".into(), "1:01:15".into()));
+        assert_eq!([0, 1, 4, 5, 40].map(|retries| retry_delay(retries).as_secs()), [1, 2, 16, 30, 30]);
     }
 
     /// Renders every screen offscreen, light and dark, into $BKN_SHOTS as PNGs,
@@ -1786,7 +2018,7 @@ mod tests {
             ..Default::default()
         };
         let (window, shell) =
-            cx.update(|cx| gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| Shell::new(None, Lang::En, window, cx)))).unwrap();
+            cx.update(|cx| gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| Shell::new(None, Lang::En, crate::prefs::Prefs::default(), window, cx)))).unwrap();
         let proxy = |id, name: &str| Proxy { id, name: name.into(), url: format!("socks5://u:secret@10.0.0.{id}:1080") };
         let offer = || crate::update::Offer { version: "0.3.1".into(), name: "bkn-proxy-test.dmg".into(), sha256: "".into() };
 
@@ -1845,7 +2077,10 @@ mod tests {
             shot("9-settings-open", &|shell| {
                 shell.open = Some(super::Panel::Password);
                 shell.info = lang.strings().copied.into();
-                shell.totp_setup = Some(crate::wire::TotpSetup { secret: "JBSWY3DPEHPK3PXP".into(), otpauth_url: "otpauth://totp/bkn-proxy".into() });
+                shell.totp_started(crate::wire::TotpSetup {
+                    secret: "JBSWY3DPEHPK3PXP".into(),
+                    otpauth_url: "otpauth://totp/bkn-proxy:test@example.com?secret=JBSWY3DPEHPK3PXP&issuer=bkn-proxy".into(),
+                });
             });
             shot("7-leftovers", &|shell| {
                 shell.open = None;
