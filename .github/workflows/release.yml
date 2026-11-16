@@ -1,0 +1,113 @@
+# Builds the desktop app for macOS and Windows and publishes a GitHub release
+# when a tag like v0.2.0 is pushed. The app's version comes from Cargo.toml and
+# must match the tag.
+#
+# Repository secrets:
+#   BKN_API_URL              the server the app talks to, e.g. https://example.com
+#   BKN_UPDATE_KEY           public half of the update key (base64, 32 bytes)
+#   UPDATE_SIGNING_KEY       private half, PEM (see scripts/release-manifest.sh)
+#   APPLE_CERTIFICATE_P12    Developer ID Application certificate, base64 of the .p12
+#   APPLE_CERTIFICATE_PASSWORD
+#   APPLE_SIGN_IDENTITY      "Developer ID Application: Name (TEAMID)"
+#   APPLE_API_KEY_P8         App Store Connect API key for notarization, the .p8 text
+#   APPLE_API_KEY_ID
+#   APPLE_API_ISSUER
+# Windows builds are not signed yet.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        arch: [aarch64, x86_64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Import the signing certificate into a throwaway keychain
+        env:
+          P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          P12_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN=$RUNNER_TEMP/build.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 16)
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -P "$P12_PASSWORD" -T /usr/bin/codesign -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN"
+          rm "$RUNNER_TEMP/cert.p12"
+      - name: Build, sign and notarize
+        env:
+          BKN_API_URL: ${{ secrets.BKN_API_URL }}
+          BKN_UPDATE_KEY: ${{ secrets.BKN_UPDATE_KEY }}
+          APPLE_SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          export APPLE_API_KEY_PATH=$RUNNER_TEMP/notary.p8
+          printf '%s\n' "$APPLE_API_KEY_P8" > "$APPLE_API_KEY_PATH"
+          scripts/package-macos.sh ${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: dist/bkn-proxy-macos-${{ matrix.arch }}.dmg
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        env:
+          BKN_API_URL: ${{ secrets.BKN_API_URL }}
+          BKN_UPDATE_KEY: ${{ secrets.BKN_UPDATE_KEY }}
+        run: cargo build --release --locked -p bkn-proxy
+      - name: Package with the wintun driver
+        shell: pwsh
+        run: |
+          # wintun is the TUN driver the tunnel needs; its DLL is signed by WireGuard LLC.
+          Invoke-WebRequest https://www.wintun.net/builds/wintun-0.14.1.zip -OutFile wintun.zip
+          $hash = (Get-FileHash wintun.zip -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne '07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51') { throw "wintun.zip checksum mismatch: $hash" }
+          Expand-Archive wintun.zip -DestinationPath .
+          New-Item -ItemType Directory -Force dist/bkn-proxy | Out-Null
+          Copy-Item target/release/bkn-proxy.exe, wintun/bin/amd64/wintun.dll dist/bkn-proxy/
+          Compress-Archive -Path dist/bkn-proxy -DestinationPath dist/bkn-proxy-windows-x86_64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: dist/bkn-proxy-windows-x86_64.zip
+          if-no-files-found: error
+
+  publish:
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Check the tag matches the app version
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "bkn-proxy").version')
+          [ "v$VERSION" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME does not match version $VERSION in Cargo.toml"; exit 1; }
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+      - name: Write and sign the update manifest
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: scripts/release-manifest.sh "$VERSION" dist
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes

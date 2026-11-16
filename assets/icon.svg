@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- macOS icon grid: an 824 tile inside a 1024 canvas. Dark ground, light ink, signal dot. -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="#1e1e1d"/>
+  <g transform="translate(205 208) scale(9.375)">
+    <path d="M4 20 H24 L40 44 H45" fill="none" stroke="#f1f1ee" stroke-width="9" stroke-linejoin="round"/>
+    <circle cx="55" cy="44" r="6.5" fill="#ff6a2b"/>
+  </g>
+</svg>
