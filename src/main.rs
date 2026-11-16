@@ -1,6 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 mod api;
 mod i18n;
+mod net;
 mod signin;
 mod tray;
 mod tunnel;
@@ -35,7 +36,10 @@ use tunnel::Tunnel;
 
 /// reqwest and the tunnel need tokio; GPUI has its own executor. Work runs
 /// here and GPUI tasks await the JoinHandle.
-static RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| tokio::runtime::Runtime::new().expect("tokio runtime"));
+// Two workers: the app only waits on the network. (The helper, which moves
+// the traffic, has a runtime of its own sized to the machine.)
+static RT: LazyLock<tokio::runtime::Runtime> =
+    LazyLock::new(|| tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("tokio runtime"));
 
 /// `host:port` of a proxy URL, without the credentials.
 fn host(url: &str) -> &str {
@@ -80,6 +84,11 @@ struct Shell {
     totp_setup: Option<TotpSetup>,
     tunnel: Option<Tunnel>,
     launching: bool,
+    /// A repair is waiting for the helper to start.
+    pending_repair: bool,
+    repairing: bool,
+    /// An older version left network settings that can block the internet.
+    leftovers: bool,
     tunnel_states: mpsc::UnboundedSender<String>,
     refresh: Option<mpsc::UnboundedSender<()>>,
     /// The proxy whose name is being edited, and the field it is edited in.
@@ -150,6 +159,11 @@ impl Shell {
                             traffic.tick(sent, received);
                         }
                         this.report(false);
+                    } else if state == "repaired" {
+                        tracing::info!("network repaired");
+                        this.repairing = false;
+                        this.leftovers = false;
+                        this.info = this.lang.strings().network_repaired.into();
                     } else if state == "up" {
                         tracing::info!("tunnel up");
                         this.link = Link::On;
@@ -183,17 +197,28 @@ impl Shell {
             }
             false
         });
+        let mut tray_clicks = tray::listen();
         cx.spawn_in(window, async move |this, cx| {
-            loop {
-                cx.background_executor().timer(tray::POLL).await;
-                let alive = this.update_in(cx, |this, window, cx| {
-                    for action in tray::actions() {
-                        this.tray_action(action, window, cx);
-                    }
-                });
-                if alive.is_err() {
+            while let Some(action) = tray_clicks.recv().await {
+                if this.update_in(cx, |this, window, cx| this.tray_action(action, window, cx)).is_err() {
                     break;
                 }
+            }
+        })
+        .detach();
+
+        // Network settings an older version may have left behind, found once at
+        // start. (Not in tests: they run the UI on a deterministic scheduler.)
+        #[cfg(not(test))]
+        cx.spawn(async move |this, cx| {
+            if let Ok(found) = RT.spawn_blocking(net::leftovers).await {
+                if !found.is_empty() {
+                    tracing::warn!(?found, "network settings left by an older version");
+                }
+                let _ = this.update(cx, |this, cx| {
+                    this.leftovers = !found.is_empty();
+                    cx.notify();
+                });
             }
         })
         .detach();
@@ -213,6 +238,9 @@ impl Shell {
             totp_setup: None,
             tunnel: None,
             launching: false,
+            pending_repair: false,
+            repairing: false,
+            leftovers: false,
             tunnel_states,
             refresh: None,
             renaming: None,
@@ -454,8 +482,30 @@ impl Shell {
             tunnel.connect(&url); // helper already running: instant switch
             return;
         }
+        self.ensure_helper(cx);
+    }
+
+    /// Undoes network settings an older version left behind. Needs the
+    /// helper, so the first time it asks for the administrator password.
+    fn repair_network(&mut self, cx: &mut Context<Self>) {
+        self.note = "".into();
+        self.info = "".into();
+        self.repairing = true;
+        match self.tunnel.as_ref().filter(|t| t.alive()) {
+            Some(tunnel) => tunnel.repair(),
+            None => {
+                self.pending_repair = true;
+                self.ensure_helper(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Starts the elevated helper unless it is starting already. When it is
+    /// up it connects to the active proxy and runs a waiting repair.
+    fn ensure_helper(&mut self, cx: &mut Context<Self>) {
         if self.launching {
-            return; // the launch below connects to whatever is active when it finishes
+            return;
         }
         self.launching = true;
         let states = self.tunnel_states.clone();
@@ -469,11 +519,16 @@ impl Shell {
                         if let Some(proxy) = wanted {
                             tunnel.connect(&proxy.url);
                         }
+                        if std::mem::take(&mut this.pending_repair) {
+                            tunnel.repair();
+                        }
                         this.tunnel = Some(tunnel);
                     }
                     failed => {
                         this.active = None;
                         this.link = Link::Off;
+                        this.pending_repair = false;
+                        this.repairing = false;
                         this.note = match failed {
                             // The outermost message is a code or, failing that, the system's reason.
                             Ok(Err(error)) => this.lang.strings().message(&error.to_string()).to_string().into(),
@@ -814,6 +869,15 @@ impl Shell {
                             ),
                         ),
                     )
+                    .child(
+                        block(s.network, "", p).child(
+                            v_flex().gap(px(10.)).child(label(s.network_hint, p)).child(
+                                button("repair", if self.repairing { s.repairing } else { s.repair_network }, Kind::Default, false, cx)
+                                    .w_full()
+                                    .on_click(cx.listener(|this, _, _, cx| this.repair_network(cx))),
+                            ),
+                        ),
+                    )
                     .child(block(s.language, "", p).child(h_flex().gap(px(8.)).children(Lang::ALL.map(|lang| {
                         // The current language is the ink-filled one.
                         let kind = if lang == self.lang { Kind::Solid } else { Kind::Default };
@@ -847,7 +911,19 @@ impl Render for Shell {
             Screen::Proxies => self.proxies_screen(p, cx),
             Screen::Settings => self.settings_screen(p, cx),
         };
-        div()
+        let s = self.lang.strings();
+        let banner = (self.leftovers && self.screen != Screen::Settings).then(|| {
+            v_flex()
+                .items_start()
+                .gap(px(8.))
+                .pb(px(16.))
+                .child(div().w_full().text_size(px(15.)).text_color(p.signal).child(s.leftovers_found))
+                .child(
+                    button("repair-banner", if self.repairing { s.repairing } else { s.repair_network }, Kind::Solid, true, cx)
+                        .on_click(cx.listener(|this, _, _, cx| this.repair_network(cx))),
+                )
+        });
+        v_flex()
             .size_full()
             .px(px(24.))
             .pt(px(20.))
@@ -856,7 +932,8 @@ impl Render for Shell {
             .text_color(p.ink)
             .text_size(px(17.))
             .line_height(relative(1.45))
-            .child(body)
+            .children(banner)
+            .child(body.flex_1())
     }
 }
 
@@ -1288,6 +1365,7 @@ mod tests {
             });
             shot("3-off", &|shell| {
                 shell.signing_in = None;
+                shell.leftovers = false;
                 shell.screen = Screen::Proxies;
                 shell.note = "".into();
                 shell.active = None;
@@ -1311,6 +1389,12 @@ mod tests {
                 shell.traffic = Some(traffic);
             });
             shot("5-settings", &|shell| shell.screen = Screen::Settings);
+            shot("7-leftovers", &|shell| {
+                shell.screen = Screen::Proxies;
+                shell.leftovers = true;
+                shell.renaming = None;
+                shell.update = None;
+            });
             shot("6-rename-and-update", &|shell| {
                 shell.screen = Screen::Proxies;
                 shell.active = None;

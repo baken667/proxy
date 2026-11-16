@@ -1,6 +1,6 @@
 [package]
 name = "bkn-proxy"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Desktop app that routes the whole device through a SOCKS5 proxy"
 publish = false
@@ -12,6 +12,8 @@ tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 gpui-kit = "0.10"
 tun2proxy = { version = "0.8", default-features = false }
+# The same tun crate tun2proxy uses: the helper makes the device itself (see net.rs).
+tun = { version = "0.8", features = ["async"] }
 reqwest = { version = "0.13", features = ["json"] }
 keyring = "4"
 rand = "0.10"
@@ -25,6 +27,10 @@ url = "2"
 tray-icon = "0.26"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Session-bound DNS settings for the tunnel (net.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+system-configuration = "0.6"
 
 # tray-icon needs a GTK main loop on Linux; it runs on a thread of its own.
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -40,3 +46,9 @@ gpui-kit = { version = "0.10", features = ["test-support"] }
 # macOS platform, can be created off the main thread.
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 gpui_apple = { package = "gpui-pre-apple", version = "=0.3.12" }
+
+# Smaller and faster release builds: whole-program optimization, no symbols.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

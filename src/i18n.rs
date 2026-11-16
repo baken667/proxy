@@ -131,6 +131,12 @@ pub struct Strings {
     pub change_password: &'static str,
     pub password_changed: &'static str,
     pub language: &'static str,
+    pub network: &'static str,
+    pub network_hint: &'static str,
+    pub repair_network: &'static str,
+    pub repairing: &'static str,
+    pub network_repaired: &'static str,
+    pub leftovers_found: &'static str,
 
     // Problems
     pub proxy_revoked: &'static str,
@@ -232,6 +238,12 @@ const EN: Strings = Strings {
     change_password: "Change password",
     password_changed: "Password changed. Your other devices were signed out.",
     language: "Language",
+    network: "Network",
+    network_hint: "If the internet stops working after a disconnect or a crash, this puts the device's DNS and routes back. Asks for the administrator password.",
+    repair_network: "Repair network",
+    repairing: "Repairing…",
+    network_repaired: "Network settings repaired",
+    leftovers_found: "An earlier version left network settings that can block the internet.",
 
     proxy_revoked: "The proxy you were using is no longer available",
     session_not_saved: "Signed in, but the session can't be saved: {}",
@@ -309,6 +321,12 @@ const RU: Strings = Strings {
     change_password: "Сменить пароль",
     password_changed: "Пароль изменён. На других устройствах выполнен выход.",
     language: "Язык",
+    network: "Сеть",
+    network_hint: "Если после отключения или сбоя пропал интернет, это вернёт DNS и маршруты устройства. Спросит пароль администратора.",
+    repair_network: "Починить сеть",
+    repairing: "Чиню…",
+    network_repaired: "Настройки сети исправлены",
+    leftovers_found: "Прошлая версия оставила настройки сети, которые могут блокировать интернет.",
 
     proxy_revoked: "Прокси, которым вы пользовались, больше недоступен",
     session_not_saved: "Вход выполнен, но сохранить сессию не удалось: {}",

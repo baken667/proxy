@@ -55,11 +55,28 @@ BKN_SHOTS=/tmp/bkn-shots cargo test shots
 
 The first Connect re-launches the app's own binary with administrator rights
 as a helper (one password prompt: `osascript` on macOS, UAC on Windows,
-`pkexec` on Linux). The helper creates a TUN device, routes all traffic into
-it and forwards it to the chosen proxy; names are resolved by the proxy, so
+`pkexec` on Linux). The helper creates a tun device and forwards everything
+in it to the chosen proxy with tun2proxy; names are resolved by the proxy, so
 DNS does not leak. Switching proxies reuses the running helper, so it is
-instant. Quitting the app stops the helper and restores the routes. See
-`src/tunnel.rs`.
+instant. Quitting the app stops the helper.
+
+On macOS and Windows every network change undoes itself if the helper goes
+away, even if it is killed (see `src/net.rs`):
+
+- The system's default route is never touched. Two half-routes, 0.0.0.0/1
+  and 128.0.0.0/1, point into the tun device; they vanish with it.
+- DNS points into the tunnel only through settings that live as long as the
+  helper: on macOS keys of its SystemConfiguration session, on Windows the
+  tun adapter's own DNS. Saved network settings are never written.
+- The tunnel uses 198.51.100.0/30, an address range no real network uses, so
+  it can't hide the local network.
+
+Versions 0.1.0 and 0.2.0 could leave DNS pointed at 10.0.0.1 or the default
+route changed after a crash. The app checks for that at start and offers
+Repair network (also in Settings), and every connect repairs it first.
+
+Linux still uses tun2proxy's own setup, which does not undo itself if the
+helper is killed.
 
 Windows needs `wintun.dll` next to the executable; the release build ships it.
 

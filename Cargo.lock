@@ -771,7 +771,7 @@ dependencies = [
 
 [[package]]
 name = "bkn-proxy"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -788,10 +788,12 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "sys-locale",
+ "system-configuration 0.6.1",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "tray-icon",
+ "tun",
  "tun2proxy",
  "url",
  "winresource",

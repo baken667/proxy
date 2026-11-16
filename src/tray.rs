@@ -1,8 +1,6 @@
 //! The icon in the menu bar (macOS) or notification area (Windows, Linux).
 //! It shows whether the tunnel is on, switches connections, brings the window
 //! back and quits; the app keeps running in the background with no window.
-use std::time::Duration;
-
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,
     menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
@@ -87,9 +85,16 @@ fn action(event: MenuEvent) -> Option<Action> {
     }
 }
 
-/// Menu clicks since the last call, from whichever thread drew the menu.
-pub fn actions() -> Vec<Action> {
-    std::iter::from_fn(|| MenuEvent::receiver().try_recv().ok()).filter_map(action).collect()
+/// Menu clicks, as they happen. The menu calls back on whichever thread
+/// drew it; the channel wakes the app's task, so nothing polls.
+pub fn listen() -> tokio::sync::mpsc::UnboundedReceiver<Action> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+        if let Some(action) = action(event) {
+            let _ = tx.send(action);
+        }
+    }));
+    rx
 }
 
 // macOS and Windows: the tray lives on the main thread, inside GPUI's own event loop.
@@ -149,7 +154,7 @@ impl Tray {
                 while gtk::events_pending() {
                     gtk::main_iteration_do(false);
                 }
-                match rx.recv_timeout(Duration::from_millis(50)) {
+                match rx.recv_timeout(std::time::Duration::from_millis(50)) {
                     Ok((state, s)) => {
                         set_icon(&tray, state.on);
                         tray.set_menu(Some(Box::new(menu(&state, s))));
@@ -169,6 +174,3 @@ impl Tray {
         }
     }
 }
-
-/// How often the app looks for menu clicks.
-pub const POLL: Duration = Duration::from_millis(150);

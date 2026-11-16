@@ -6,8 +6,8 @@
 //! (one OS password prompt). The helper stays up and connects back to the app
 //! over loopback, so switching proxies afterwards is instant and prompt-free.
 //!
-//!   app -> helper:  `connect <socks5 url>` | `disconnect`
-//!   helper -> app:  `up` | `down [reason]`
+//!   app -> helper:  `connect <socks5 url>` | `disconnect` | `repair`
+//!   helper -> app:  `up` | `down [reason]` | `repaired`
 //!
 //!                   `traffic <sent> <received>`  (bytes so far, once a second while up)
 //!                   `log <LEVEL> <message>`  (warnings and errors from tun2proxy)
@@ -17,7 +17,8 @@
 //! Its log lines travel over the same connection and the app prints them.
 //!
 //! The helper exits when that connection closes (app quit or crashed), which
-//! tears the tunnel down and restores the routes.
+//! tears the tunnel down. How the routes and DNS are set, and why the system
+//! undoes them by itself even if the helper dies: see net.rs.
 use std::{
     net::Ipv4Addr,
     path::Path,
@@ -78,6 +79,10 @@ pub fn helper_main(port: &str, token_file: &str) -> Result<()> {
                     stop(&mut running).await;
                     match line.strip_prefix("connect ") {
                         Some(url) => running = Some(start(url.to_string(), states.clone())),
+                        None if line == "repair" => {
+                            let _ = tokio::task::spawn_blocking(crate::net::repair).await;
+                            let _ = states.send("repaired".into());
+                        }
                         None => { let _ = states.send("down".into()); }
                     }
                 }
@@ -114,6 +119,17 @@ impl log::Log for Forward {
     fn flush(&self) {}
 }
 
+/// What tun2proxy is told for every connection.
+fn tunnel_args(url: &str) -> Result<Args> {
+    let mut args = Args::default();
+    args.proxy(ProxyParameters::try_from(url)?).dns(ArgDns::Virtual); // names are resolved by the proxy: no DNS leak
+    // tun2proxy's default of 200 open connections is soon reached by a browser
+    // plus background apps when the whole device goes through the tunnel, and
+    // it drops new connections past the limit: pages stall half-loaded.
+    args.max_sessions = 4096;
+    Ok(args)
+}
+
 fn start(url: String, states: mpsc::UnboundedSender<String>) -> (CancellationToken, JoinHandle<()>) {
     let cancel = CancellationToken::new();
     let token = cancel.clone();
@@ -121,33 +137,9 @@ fn start(url: String, states: mpsc::UnboundedSender<String>) -> (CancellationTok
         // The tunnel runs in a task of its own so that a panic inside it comes
         // back here as an error and is reported. Otherwise the app would keep
         // showing "Connected" over a tunnel that no longer exists.
-        let run = tokio::spawn({
-            let (token, states) = (token.clone(), states.clone());
-            async move {
-                let mut args = Args::default();
-                args.proxy(ProxyParameters::try_from(url.as_str())?)
-                    .setup(true) // create the routes (and remove them on exit)
-                    .dns(ArgDns::Virtual) // names are resolved by the proxy: no DNS leak
-                    .ipv6_enabled(true); // route v6 into the tunnel too, or it bypasses the proxy
-                // A macOS utun device puts a 4-byte header on every packet, and
-                // `true` is what makes the tun crate strip and add it. With
-                // `false` the tunnel comes up but no packet parses, so nothing
-                // flows. tun2proxy's own binary passes exactly this.
-                let packet_information = cfg!(target_os = "macos");
-                let run = tun2proxy::general_run_async(args, tun2proxy::DEFAULT_MTU, packet_information, token.clone());
-                tokio::pin!(run);
-                // ponytail: tun2proxy has no "ready" signal. Setup failures (no
-                // privileges, bad proxy address) return within milliseconds, so
-                // "still running after 1s" is treated as up.
-                if let Ok(early) = tokio::time::timeout(Duration::from_secs(1), &mut run).await {
-                    return anyhow::Ok(early?);
-                }
-                let _ = states.send("up".into());
-                Ok(run.await?)
-            }
-        });
+        let run = tokio::spawn(run_tunnel(url, token.clone(), states.clone()));
         let reason = match run.await {
-            Ok(Ok(_)) => "tunnel stopped".to_string(),
+            Ok(Ok(())) => "tunnel stopped".to_string(),
             Ok(Err(error)) => format!("{error:#}"),
             Err(crash) => format!("tunnel crashed: {crash}"),
         };
@@ -156,6 +148,68 @@ fn start(url: String, states: mpsc::UnboundedSender<String>) -> (CancellationTok
         }
     });
     (cancel, task)
+}
+
+/// macOS and Windows: we make the tun device and the network changes
+/// ourselves (net.rs), so they undo themselves if the helper dies.
+#[cfg(any(target_os = "macos", windows))]
+async fn run_tunnel(url: String, token: CancellationToken, states: mpsc::UnboundedSender<String>) -> Result<()> {
+    let mut args = tunnel_args(&url)?;
+    // Find the proxy's address now, while the system's own DNS still answers.
+    let proxy = args.proxy.addr.as_ref().context("the proxy URL has no address")?.resolve_using_tokio().await?.next().context("the proxy's name doesn't resolve")?;
+    args.proxy.addr = Some(proxy.into());
+
+    // What an older version left behind would fight the new routes.
+    tokio::task::spawn_blocking(crate::net::repair).await?;
+
+    let mut config = tun::Configuration::default();
+    config.address(crate::net::TUN_ADDR).netmask(crate::net::TUN_MASK).destination(crate::net::TUN_PEER).mtu(tun2proxy::DEFAULT_MTU).up();
+    // A macOS utun device puts a 4-byte header on every packet, and `true` is
+    // what makes the tun crate strip and add it. With `false` the tunnel comes
+    // up but no packet parses, so nothing flows.
+    #[cfg(target_os = "macos")]
+    config.platform_config(|c| {
+        c.packet_information(true);
+    });
+    #[cfg(windows)]
+    {
+        config.tun_name("bkn-proxy");
+        config.platform_config(|c| {
+            c.device_guid(0x6b6e_2d70_726f_7879_0000_0000_0000_0001);
+            // The adapter's own DNS: it goes away with the adapter.
+            c.dns_servers(&[crate::net::TUN_PEER.into()]);
+            c.wait_for_interfaces(true, false, Duration::from_secs(10));
+        });
+    }
+    let device = tun::create_as_async(&config).context("can't create the tunnel device")?;
+    let name = tun::AbstractDevice::tun_name(&*device)?;
+    let network = tokio::task::spawn_blocking(move || crate::net::Network::apply(&name, proxy.ip())).await??;
+    let _ = states.send("up".into());
+
+    let result = tun2proxy::run(device, tun2proxy::DEFAULT_MTU, args, token).await;
+    // Undo the routes and DNS (blocking commands) before reporting anything.
+    tokio::task::spawn_blocking(move || drop(network)).await?;
+    result?;
+    Ok(())
+}
+
+/// Linux: tun2proxy's own setup, as before.
+// ponytail: unlike macOS and Windows, this doesn't undo itself if the helper
+// is killed. Port net.rs to Linux (ip route, resolvectl) when Linux ships.
+#[cfg(not(any(target_os = "macos", windows)))]
+async fn run_tunnel(url: String, token: CancellationToken, states: mpsc::UnboundedSender<String>) -> Result<()> {
+    let mut args = tunnel_args(&url)?;
+    args.setup(true);
+    let run = tun2proxy::general_run_async(args, tun2proxy::DEFAULT_MTU, false, token);
+    tokio::pin!(run);
+    // tun2proxy has no "ready" signal; setup failures return within milliseconds.
+    if let Ok(early) = tokio::time::timeout(Duration::from_secs(1), &mut run).await {
+        early?;
+        return Ok(());
+    }
+    let _ = states.send("up".into());
+    run.await?;
+    Ok(())
 }
 
 async fn stop(running: &mut Option<(CancellationToken, JoinHandle<()>)>) {
@@ -180,6 +234,11 @@ impl Tunnel {
     pub fn connect(&self, url: &str) {
         // One command per line: a control character must never smuggle a second one.
         let _ = self.commands.send(format!("connect {}", url.replace(char::is_control, "")));
+    }
+
+    /// Undoes network settings an older version left behind; answers `repaired`.
+    pub fn repair(&self) {
+        let _ = self.commands.send("repair".into());
     }
 
     pub fn disconnect(&self) {
