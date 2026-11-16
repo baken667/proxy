@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Builds bkn-proxy.app and a .dmg for one Mac architecture, into dist/.
+# Builds bkn-proxy.app and a .dmg into dist/. Releases ship Apple Silicon
+# (aarch64) only; x86_64 still builds by hand if ever needed.
 #
 #   BKN_API_URL=https://example.com scripts/package-macos.sh [aarch64|x86_64]
 #

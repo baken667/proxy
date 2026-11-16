@@ -58,7 +58,7 @@ Windows needs `wintun.dll` next to the executable; the release build ships it.
 
 Pushing a tag such as `v0.2.0` (matching `version` in `Cargo.toml`) runs
 `.github/workflows/release.yml`: it builds and notarizes the macOS disk
-images, builds the Windows archive, writes the signed update manifest and
+image (Apple Silicon only), builds the Windows archive, writes the signed update manifest and
 publishes a GitHub release. The secrets it needs are listed at the top of
 that file. Windows builds are not code-signed yet.
 

@@ -24,10 +24,7 @@ permissions:
 
 jobs:
   macos:
-    runs-on: macos-latest
-    strategy:
-      matrix:
-        arch: [aarch64, x86_64]
+    runs-on: macos-latest # Apple Silicon only: no Intel build
     steps:
       - uses: actions/checkout@v4
       - name: Import the signing certificate into a throwaway keychain
@@ -56,11 +53,11 @@ jobs:
         run: |
           export APPLE_API_KEY_PATH=$RUNNER_TEMP/notary.p8
           printf '%s\n' "$APPLE_API_KEY_P8" > "$APPLE_API_KEY_PATH"
-          scripts/package-macos.sh ${{ matrix.arch }}
+          scripts/package-macos.sh aarch64
       - uses: actions/upload-artifact@v4
         with:
-          name: macos-${{ matrix.arch }}
-          path: dist/bkn-proxy-macos-${{ matrix.arch }}.dmg
+          name: macos-aarch64
+          path: dist/bkn-proxy-macos-aarch64.dmg
           if-no-files-found: error
 
   windows:
