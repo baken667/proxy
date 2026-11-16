@@ -18,6 +18,9 @@ name: release
 on:
   push:
     tags: ['v*']
+  # A build without a release: Actions → release → Run workflow. Use it to
+  # check the macOS and Windows builds before tagging.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -88,6 +91,7 @@ jobs:
 
   publish:
     needs: [macos, windows]
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

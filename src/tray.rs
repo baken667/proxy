@@ -10,6 +10,28 @@ use tray_icon::{
 
 use crate::i18n::Strings;
 
+// macOS draws a template icon in the menu bar's own colour. The template calls
+// exist only in the macOS build of tray-icon, hence #[cfg] and not cfg!().
+#[cfg(target_os = "macos")]
+fn with_icon(builder: TrayIconBuilder, on: bool) -> TrayIconBuilder {
+    builder.with_icon_templated(icon(on))
+}
+
+#[cfg(target_os = "macos")]
+fn set_icon(tray: &TrayIcon, on: bool) {
+    let _ = tray.set_icon_templated(Some(icon(on)));
+}
+
+#[cfg(not(target_os = "macos"))]
+fn with_icon(builder: TrayIconBuilder, on: bool) -> TrayIconBuilder {
+    builder.with_icon(icon(on))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_icon(tray: &TrayIcon, on: bool) {
+    let _ = tray.set_icon(Some(icon(on)));
+}
+
 /// What the menu shows. A new value rebuilds it.
 #[derive(Clone, PartialEq, Default)]
 pub struct State {
@@ -80,10 +102,7 @@ pub struct Tray {
 #[cfg(not(target_os = "linux"))]
 impl Tray {
     pub fn new(state: &State, s: &Strings) -> Option<Tray> {
-        let builder = TrayIconBuilder::new();
-        // macOS draws a template icon in the menu bar's own colour.
-        let builder = if cfg!(target_os = "macos") { builder.with_icon_templated(icon(state.on)) } else { builder.with_icon(icon(state.on)) };
-        let icon = builder
+        let icon = with_icon(TrayIconBuilder::new(), state.on)
             .with_tooltip("bkn-proxy")
             .with_menu(Box::new(menu(state, s)))
             .build()
@@ -97,7 +116,7 @@ impl Tray {
             return;
         }
         if state.on != self.shown.on {
-            let _ = if cfg!(target_os = "macos") { self.icon.set_icon_templated(Some(icon(state.on))) } else { self.icon.set_icon(Some(icon(state.on))) };
+            set_icon(&self.icon, state.on);
         }
         self.icon.set_menu(Some(Box::new(menu(state, s))));
         self.shown = state.clone();
@@ -122,7 +141,7 @@ impl Tray {
                 tracing::warn!("no tray icon: GTK did not start");
                 return;
             }
-            let Ok(tray) = TrayIconBuilder::new().with_icon(icon(first.on)).with_tooltip("bkn-proxy").with_menu(Box::new(menu(&first, s))).build() else {
+            let Ok(tray) = with_icon(TrayIconBuilder::new(), first.on).with_tooltip("bkn-proxy").with_menu(Box::new(menu(&first, s))).build() else {
                 tracing::warn!("no tray icon");
                 return;
             };
@@ -132,7 +151,7 @@ impl Tray {
                 }
                 match rx.recv_timeout(Duration::from_millis(50)) {
                     Ok((state, s)) => {
-                        let _ = tray.set_icon(Some(icon(state.on)));
+                        set_icon(&tray, state.on);
                         tray.set_menu(Some(Box::new(menu(&state, s))));
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
