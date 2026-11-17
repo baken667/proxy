@@ -208,14 +208,39 @@ after an approver confirms the request.
 
 ## Privacy
 
+This is the project's privacy policy.
+
 The app talks to one server, the one it was built for (`BKN_API_URL`), and to
-the proxy you connect to. To the server it sends your sign-in, the names you
-give connections, and, every five seconds while connected, which proxy is in
-use and how many bytes went through it. It does not send addresses, DNS names
-or anything else about the traffic. It also asks the server whether there is a
-newer version. Nothing goes to anyone else: no analytics, no crash reports.
+the proxy you connect to. Nothing goes to anyone else: no analytics, no crash
+reports, no third-party services.
+
+What the app sends to the server:
+
+- Your sign-in. You sign in on the server's page in the browser; the app gets
+  a session token and keeps it in the system's keychain (Credential Manager on
+  Windows).
+- The kind of device, as "Mac" or "Windows PC".
+- The names you give connections.
+- While connected, every five seconds: which connection is in use and how
+  many bytes went through it. No addresses, no DNS names, nothing else about
+  the traffic.
+- A question whether there is a newer version, every hour.
+
+What the server keeps: your account (email address, password hash, two-factor
+and passkey settings), your sessions with the kind of device and the IP
+address they came from, a log of account actions with the IP address, and one
+record per connection: which proxy, when it started and ended, and the byte
+counts. The server's administrators see this in its backoffice; they create
+the accounts and can delete them, and deleting an account deletes its
+sessions and connection records. The server is run by whoever gave you the
+account: ask them about anything it holds on you.
+
 While connected, all of the device's traffic goes through the chosen proxy,
 whose operator can see it as any network operator can.
+
+On the device the app keeps its settings (`prefs.json`, see Settings on disk)
+and the session token. Uninstalling leaves both; signing out removes the
+token.
 
 ## Languages and design
 

@@ -175,4 +175,7 @@ jobs:
           # The release notes are this version's section of CHANGELOG.md, without its heading.
           awk -v version="$VERSION" '/^## / { on = ($2 == version); next } on' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
           [ -s "$RUNNER_TEMP/notes.md" ] || { echo "CHANGELOG.md has no section for $VERSION"; exit 1; }
+          # A release page is a download page: it names the signing and privacy policies.
+          README=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY#
+          printf '\n---\n[Code signing policy](%scode-signing-policy): Windows code signing through [SignPath Foundation](https://signpath.org). [Privacy](%sprivacy).\n' "$README" "$README" >> "$RUNNER_TEMP/notes.md"
           gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md"
