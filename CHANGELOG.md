@@ -4,6 +4,12 @@ What changed in each release of the bkn-proxy desktop app. The section for a
 version becomes the notes of its GitHub release, where a line break inside a
 paragraph shows as one: keep each entry on a single line.
 
+## 0.5.1 — 2026-11-17
+
+- Fixed: on Windows a connect could leave the device without internet while the tunnel was up: pages did not open and names did not resolve. The tunnel helper took the tunnel itself for the network's gateway, so its own connections to the proxy went back into the tunnel until it was full and dropped everything, DNS included.
+- Connecting on Windows is a little faster: the helper no longer starts PowerShell to find the gateway.
+- macOS: nothing changes in how the tunnel works, but the first connect after this update asks for the administrator password once more, as the tunnel helper was rebuilt.
+
 ## 0.5.0 — 2026-11-17
 
 - Fixed: signing in on Windows. The browser opened a page saying the sign-in link was incomplete, because Windows cut the link at its first `&`.

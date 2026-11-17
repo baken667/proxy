@@ -1,6 +1,6 @@
 ; The Windows installer (Inno Setup 6). The release workflow compiles it:
 ;
-;   iscc /DMyAppVersion=0.5.0 scripts\installer.iss
+;   iscc /DMyAppVersion=0.5.1 scripts\installer.iss
 ;
 ; It takes target\release\bkn-proxy.exe and wintun\bin\amd64\wintun.dll and
 ; writes dist\bkn-proxy-windows-x86_64.exe.
