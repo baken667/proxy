@@ -422,18 +422,14 @@ mod os {
 mod os {
     use super::*;
 
-    fn powershell(script: &str) -> Result<String> {
-        run("powershell", &["-NoProfile", "-NonInteractive", "-Command", script])
-    }
-
-    /// The next hop of the best default route that isn't the tunnel's.
+    /// The next hop of the best default route that isn't the tunnel's. The
+    /// tunnel has one from the moment its adapter exists (the tun crate adds
+    /// it, metric 0, on the fastest adapter there is) and it is the best one:
+    /// taken as the gateway, it sends the proxy's own route into the tunnel,
+    /// every connection to the proxy opens another one, and the tunnel fills
+    /// up until it drops everything, DNS included.
     pub fn default_gateway() -> Option<String> {
-        let script = "Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue \
-            | Where-Object { $_.NextHop -ne '0.0.0.0' -and $_.NextHop -ne '10.0.0.1' } \
-            | Sort-Object { $_.RouteMetric + (Get-NetIPInterface -InterfaceIndex $_.InterfaceIndex -AddressFamily IPv4).InterfaceMetric } \
-            | Select-Object -First 1 -ExpandProperty NextHop";
-        let out = powershell(script).ok()?;
-        out.trim().parse::<Ipv4Addr>().ok().map(|ip| ip.to_string())
+        routes("", "").0.into_iter().next()
     }
 
     pub fn routes(proxy: &str, _tun: &str) -> (Vec<String>, Option<String>) {
@@ -578,14 +574,19 @@ mod tests {
             Network Destination        Netmask          Gateway       Interface  Metric\n\
             \x20         0.0.0.0          0.0.0.0      192.168.1.1     192.168.1.78     35\n\
             \x20         0.0.0.0          0.0.0.0       10.20.0.1       10.20.0.15     25\n\
+            \x20         0.0.0.0          0.0.0.0     198.51.100.2     198.51.100.1      5\n\
             \x20         0.0.0.0        128.0.0.0     198.51.100.2     198.51.100.1      1\n\
             \x20       127.0.0.0        255.0.0.0         On-link         127.0.0.1    331\n\
             \x20     203.0.113.7  255.255.255.255      192.168.1.1     192.168.1.78     36\n\
             ===========\nPersistent Routes:\n\
             \x20 Network Address          Netmask  Gateway Address  Metric\n\
             \x20         0.0.0.0          0.0.0.0         10.9.9.9  Default\n";
+        // The tunnel's own default route has the lowest metric and is never a way out.
         let (found, own) = read_route_print(route_print, "203.0.113.7");
         assert_eq!((found, own.as_deref()), (gateways(&["10.20.0.1", "192.168.1.1"]), Some("192.168.1.1")));
+        // What `apply` and `follow` see when the proxy's route points into the tunnel: no route at all.
+        let looped = route_print.replace("203.0.113.7  255.255.255.255      192.168.1.1     192.168.1.78", "203.0.113.7  255.255.255.255     198.51.100.2     198.51.100.1");
+        assert_eq!(read_route_print(&looped, "203.0.113.7").1, None);
     }
 
     /// Runs the read-only check against this computer: it must not fail, and
