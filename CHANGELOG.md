@@ -4,6 +4,14 @@ What changed in each release of the bkn-proxy desktop app. The section for a
 version becomes the notes of its GitHub release, where a line break inside a
 paragraph shows as one: keep each entry on a single line.
 
+## 0.5.0 — 2026-11-17
+
+- Fixed: signing in on Windows. The browser opened a page saying the sign-in link was incomplete, because Windows cut the link at its first `&`.
+- Windows has an installer instead of an archive to unpack. It installs for the current user without asking for administrator rights, adds bkn-proxy to the Start menu and, if you leave the box ticked, to the desktop, and starts the app. Its language follows Windows: English or Russian. To remove the app, use Settings → Apps.
+- Updating on Windows is one click: Update downloads the installer and runs it, and the installer stops the app, replaces it and starts the new version. A tunnel that was up goes down for that moment.
+- Coming from the 0.4.0 archive: Update downloads the installer and opens it; press Install. The folder the archive was unpacked into is no longer used and can be deleted.
+- Windows builds are still not code-signed, so SmartScreen warns when the installer is first run: choose "More info", then "Run anyway". The project is applying for free signing for open source; the README says how releases will be signed and what the app sends to the server.
+
 ## 0.4.0 — 2026-11-17
 
 - The connection comes back by itself. A tunnel that goes down is reconnected: after 1, 2, 4, 8 and 16 seconds, then every 30, until it is up or you press Disconnect. A system notification says that traffic goes out directly meanwhile. Reconnect is a switch in Settings and is on.

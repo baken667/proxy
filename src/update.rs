@@ -7,9 +7,10 @@
 //! 2. `install`, on the user's click, downloads the installer for this
 //!    platform and checks it against the manifest.
 //! 3. On macOS it then puts the new app in the place of the running one,
-//!    without opening the disk image; a restart finishes the update. Where
-//!    that can't be done (Windows, Linux, an app folder this user can't write
-//!    to) the installer is handed to the system instead, as before.
+//!    without opening the disk image; a restart finishes the update. On
+//!    Windows the downloaded setup is run: it stops the app, replaces it and
+//!    starts the new one. Where neither can be done (an app folder this user
+//!    can't write to) the installer is handed to the system.
 //!
 //! The signature is what makes this safe. Whoever controls the download host
 //! can serve any file, but not one this app will accept. A build without the
@@ -150,9 +151,8 @@ fn in_place(disk_image: &Path) -> Result<bool> {
     }
 }
 
-// ponytail: Windows and Linux still get the downloaded archive opened for
-// them. In place there means swapping a running .exe; do it when those
-// platforms are worth the testing.
+// Windows: the downloaded setup does the replacing (see `open`). Linux has
+// no release build to download.
 #[cfg(not(target_os = "macos"))]
 fn in_place(_: &Path) -> Result<bool> {
     Ok(false)
@@ -225,8 +225,16 @@ pub async fn watch(found: UnboundedSender<Offer>) {
     }
 }
 
-/// Hands the installer to the system: mounts the .dmg, or opens the archive.
+/// Hands the installer to the system. macOS mounts the .dmg. On Windows it is
+/// the setup (scripts/installer.iss), run with only its progress window: it
+/// stops this app, replaces it and starts the new one.
 pub fn open(installer: &Path) {
+    if cfg!(windows) {
+        if let Err(error) = std::process::Command::new(installer).arg("/SILENT").spawn() {
+            tracing::error!("could not run {installer:?}: {error}");
+        }
+        return;
+    }
     open_external(installer.as_os_str());
 }
 
@@ -235,8 +243,10 @@ pub fn open_external(target: impl AsRef<std::ffi::OsStr>) {
     let mut command = if cfg!(target_os = "macos") {
         std::process::Command::new("open")
     } else if cfg!(windows) {
-        let mut command = std::process::Command::new("cmd");
-        command.args(["/C", "start", ""]);
+        // Not `cmd /C start`: cmd cuts a URL at its first `&`, so the sign-in
+        // page got the first parameter of its link and called it incomplete.
+        let mut command = crate::net::command("rundll32");
+        command.arg("url.dll,FileProtocolHandler");
         command
     } else {
         std::process::Command::new("xdg-open")

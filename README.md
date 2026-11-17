@@ -38,9 +38,10 @@ Built with Rust, [GPUI](https://www.gpui.rs) and
 - English and Russian, light and dark; a fixed-size window.
 - Looks for a newer version every hour and from a button in Settings, and
   says when there is one: in a system notification and in a ribbon across the
-  top of every screen. Update downloads it, shows the progress and, on macOS,
-  puts it in the app's place without opening the disk image; Restart then
-  runs it.
+  top of every screen. Update downloads it and shows the progress. On macOS
+  it then puts the new app in the old one's place without opening the disk
+  image, and Restart runs it; on Windows the installer replaces the app and
+  starts it again.
 
 ## Run from source
 
@@ -130,16 +131,36 @@ itself, which starts the app with `--background`. On macOS that is
 user's `Run` key, on Linux `~/.config/autostart/kz.bkn.proxy.desktop`. The
 app rewrites the entry at every start, so it follows the app when it is moved.
 
-Windows needs `wintun.dll` next to the executable; the release build ships it.
+Windows needs `wintun.dll` next to the executable; the installer puts it there.
+
+## Installing on Windows
+
+`bkn-proxy-windows-x86_64.exe` is an installer (Inno Setup,
+`scripts/installer.iss`). It installs for the current user, into
+`%LOCALAPPDATA%\Programs\bkn-proxy`, so neither installing nor updating asks
+for administrator rights; only connecting does. It adds bkn-proxy to the Start
+menu and, unless unticked, to the desktop, and starts the app. Running a newer
+installer over a running app stops the app, replaces it and starts it again.
+Remove it from Settings → Apps; that also removes the Open at login entry. The
+saved sign-in and settings stay.
+
+To build the installer by hand, on Windows with Inno Setup 6 and `wintun/`
+unpacked from wintun.net next to `Cargo.toml`:
+
+```
+cargo build --release
+iscc /DMyAppVersion=0.0.0 scripts\installer.iss
+```
 
 ## Releases
 
 Pushing a tag such as `v0.2.0` (matching `version` in `Cargo.toml`) runs
 `.github/workflows/release.yml`: it builds and notarizes the macOS disk
-image (Apple Silicon only), builds the Windows archive, writes the signed update manifest and
-publishes a GitHub release. The release notes are that version's section of
-`CHANGELOG.md`, so write it before tagging. The secrets the workflow needs
-are listed at the top of that file. Windows builds are not code-signed yet.
+image (Apple Silicon only), builds the Windows installer, writes the signed
+update manifest and publishes a GitHub release. The release notes are that
+version's section of `CHANGELOG.md`, so write it before tagging. The secrets
+the workflow needs are listed at the top of that file. Windows builds are not
+code-signed yet: see Code signing policy below.
 
 To package for macOS by hand:
 
@@ -158,14 +179,43 @@ installer for its platform and checks it against the manifest's SHA-256.
 On macOS it mounts the disk image out of sight, copies the new app next to
 the installed one and swaps the two by renaming, so a failure on the way
 leaves the installed app as it was; Restart runs the new one. Where that is
-not possible (Windows, Linux, or an app folder the user can't write to) the
-installer is opened instead, as before. A build without `BKN_UPDATE_KEY`
-never checks for updates.
+not possible (an app folder the user can't write to) the disk image is opened
+instead. On Windows the app runs the downloaded installer with only its
+progress window; the installer stops the app, replaces it and starts the new
+one. A build without `BKN_UPDATE_KEY` never checks for updates.
 
 Before tagging a release that changes how the helper is installed or how the
 app is replaced, run the workflow by hand and try its signed disk image: an
 unsigned local build does not behave like the signed one there. Creating the key is
 described in `scripts/release-manifest.sh`.
+
+## Code signing policy
+
+macOS builds are signed with the maintainer's Developer ID and notarized by
+Apple. Windows builds are not signed yet. The project is applying for free
+code signing for open source from SignPath Foundation; once it is accepted,
+the release workflow signs the app and its installer (see the top of
+`.github/workflows/release.yml`), and this applies:
+
+Free code signing provided by [SignPath.io](https://about.signpath.io),
+certificate by [SignPath Foundation](https://signpath.org).
+
+- Committers and reviewers: [baken667](https://github.com/baken667)
+- Approvers: [baken667](https://github.com/baken667)
+
+Every release is built from this repository by GitHub Actions and signed only
+after an approver confirms the request.
+
+## Privacy
+
+The app talks to one server, the one it was built for (`BKN_API_URL`), and to
+the proxy you connect to. To the server it sends your sign-in, the names you
+give connections, and, every five seconds while connected, which proxy is in
+use and how many bytes went through it. It does not send addresses, DNS names
+or anything else about the traffic. It also asks the server whether there is a
+newer version. Nothing goes to anyone else: no analytics, no crash reports.
+While connected, all of the device's traffic goes through the chosen proxy,
+whose operator can see it as any network operator can.
 
 ## Languages and design
 
@@ -195,7 +245,7 @@ tunnel, builds on socks5-impl, which is GPL-3.0-or-later, so the app as it is
 distributed is under the GPL either way.
 
 It ships JetBrains Mono (SIL Open Font License 1.1) and Lucide icons (ISC
-License); the Windows archive adds `wintun.dll` from wintun.net under its own
+License); the Windows installer adds `wintun.dll` from wintun.net under its own
 license.
 
 To report a security problem, see `SECURITY.md`.

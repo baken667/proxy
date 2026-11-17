@@ -12,7 +12,17 @@
 #   APPLE_API_KEY_P8         App Store Connect API key for notarization, the .p8 text
 #   APPLE_API_KEY_ID
 #   APPLE_API_ISSUER
-# Windows builds are not signed yet.
+#
+# Windows code signing (SignPath Foundation, free for open source) is off until
+# the repository has the variable SIGNPATH_ORGANIZATION_ID; then tagged builds
+# are signed, and each of the two requests waits for an approval in SignPath:
+#   SIGNPATH_ORGANIZATION_ID  repository variable, the SignPath organization's id
+#   SIGNPATH_API_TOKEN        secret, a SignPath user who may submit requests
+# The SignPath project is "bkn-proxy" with the policy "release-signing" and
+# this default artifact configuration (a GitHub artifact is a zip):
+#   <artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+#     <zip-file><pe-file path="bkn-proxy*.exe"><authenticode-sign/></pe-file></zip-file>
+#   </artifact-configuration>
 name: release
 
 on:
@@ -72,21 +82,66 @@ jobs:
           BKN_API_URL: ${{ secrets.BKN_API_URL }}
           BKN_UPDATE_KEY: ${{ secrets.BKN_UPDATE_KEY }}
         run: cargo build --release --locked -p bkn-proxy
-      - name: Package with the wintun driver
+      # Signing, part one: the app itself, before it goes into the installer.
+      - name: Upload the app for signing
+        id: unsigned-app
+        if: vars.SIGNPATH_ORGANIZATION_ID != '' && startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-app
+          path: target/release/bkn-proxy.exe
+      - name: Sign the app
+        if: steps.unsigned-app.outcome == 'success'
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: bkn-proxy
+          signing-policy-slug: release-signing
+          github-artifact-id: ${{ steps.unsigned-app.outputs.artifact-id }}
+          wait-for-completion-timeout-in-seconds: 3600 # a person approves it
+          output-artifact-directory: signed
+      - name: Build the installer with the wintun driver
         shell: pwsh
         run: |
+          if (Test-Path signed/bkn-proxy.exe) { Copy-Item signed/bkn-proxy.exe target/release/ -Force }
           # wintun is the TUN driver the tunnel needs; its DLL is signed by WireGuard LLC.
           Invoke-WebRequest https://www.wintun.net/builds/wintun-0.14.1.zip -OutFile wintun.zip
           $hash = (Get-FileHash wintun.zip -Algorithm SHA256).Hash.ToLower()
           if ($hash -ne '07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51') { throw "wintun.zip checksum mismatch: $hash" }
           Expand-Archive wintun.zip -DestinationPath .
-          New-Item -ItemType Directory -Force dist/bkn-proxy | Out-Null
-          Copy-Item target/release/bkn-proxy.exe, wintun/bin/amd64/wintun.dll dist/bkn-proxy/
-          Compress-Archive -Path dist/bkn-proxy -DestinationPath dist/bkn-proxy-windows-x86_64.zip
+          $version = ((cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages | Where-Object name -eq 'bkn-proxy').version
+          # Inno Setup comes with the runner image.
+          $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source ?? "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          # Last in the step: its exit code is the step's.
+          & $iscc "/DMyAppVersion=$version" scripts\installer.iss
+      # Signing, part two: the installer.
+      - name: Upload the installer for signing
+        id: unsigned-installer
+        if: steps.unsigned-app.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-installer
+          path: dist/bkn-proxy-windows-x86_64.exe
+      - name: Sign the installer
+        if: steps.unsigned-installer.outcome == 'success'
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: bkn-proxy
+          signing-policy-slug: release-signing
+          github-artifact-id: ${{ steps.unsigned-installer.outputs.artifact-id }}
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signed
+      - name: Take the signed installer
+        if: steps.unsigned-installer.outcome == 'success'
+        shell: pwsh
+        run: Copy-Item signed/bkn-proxy-windows-x86_64.exe dist/ -Force
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x86_64
-          path: dist/bkn-proxy-windows-x86_64.zip
+          path: dist/bkn-proxy-windows-x86_64.exe
           if-no-files-found: error
 
   publish:
@@ -95,10 +150,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # By name: the windows job may also hold the unsigned files it sent for signing.
       - uses: actions/download-artifact@v4
         with:
+          name: macos-aarch64
           path: dist
-          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-x86_64
+          path: dist
       - name: Check the tag matches the app version
         run: |
           VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "bkn-proxy").version')
